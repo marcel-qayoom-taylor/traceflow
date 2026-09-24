@@ -20,6 +20,9 @@ let scanQuery = '';
 let scanModal = null;
 let scanResults = null;
 let settingsOpen = false;
+let samplePending = false;
+let sampleError = '';
+let openServiceMenu = null;
 const expandedTraceGroups = new Set();
 const pendingServiceActions = new Map();
 const pendingDiscoveredAttachments = new Set();
@@ -31,9 +34,36 @@ const LOG_HEIGHT_KEY = 'traceflow.log-height';
 const LOG_MIN_HEIGHT = 96;
 const MAIN_MIN_HEIGHT = 160;
 const INSPECTOR_WIDTH_KEY = 'traceflow.inspector-width';
+const SERVICE_ALIASES_KEY = 'traceflow.service-aliases';
+const HIDDEN_SERVICES_KEY = 'traceflow.hidden-services';
 const INSPECTOR_MIN_WIDTH = 240;
 const STAGE_MIN_WIDTH = 360;
 const BURST_GAP_MS = 3000;
+const serviceAliases = readStoredObject(SERVICE_ALIASES_KEY);
+const hiddenServices = new Set(readStoredArray(HIDDEN_SERVICES_KEY));
+
+function readStoredObject(key) {
+  try {
+    const value = JSON.parse(localStorage.getItem(key) || '{}');
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  } catch {
+    return {};
+  }
+}
+
+function readStoredArray(key) {
+  try {
+    const value = JSON.parse(localStorage.getItem(key) || '[]');
+    return Array.isArray(value) ? value.map(String) : [];
+  } catch {
+    return [];
+  }
+}
+
+function storeServicePreferences() {
+  localStorage.setItem(SERVICE_ALIASES_KEY, JSON.stringify(serviceAliases));
+  localStorage.setItem(HIDDEN_SERVICES_KEY, JSON.stringify([...hiddenServices]));
+}
 
 function rootSpan(trace) {
   return [...(trace?.spans || [])].sort((a, b) => a.startedAt - b.startedAt)[0] || null;
@@ -398,7 +428,12 @@ function renderTransport() {
     button('Resume', () => post('/api/resume')),
   );
   if (state.demo && state.sampleUrl) {
-    root.append(button('Send sample request', sendSample, { className: 'primary' }));
+    const sample = button(samplePending ? 'Sending sample…' : 'Send sample request', sendSample, {
+      className: 'primary',
+      disabled: samplePending,
+    });
+    if (sampleError) sample.title = sampleError;
+    root.append(sample);
   }
 }
 
@@ -447,6 +482,18 @@ function renderSettings() {
   });
 
   panel.append(captureHeading, captureRow, debugRow, debugNote, playbackHeading, responseRow, followRow);
+  if (hiddenServices.size) {
+    const servicesHeading = document.createElement('div');
+    servicesHeading.className = 'settings-heading';
+    servicesHeading.textContent = 'Services';
+    const restore = button(`Restore removed services (${hiddenServices.size})`, () => {
+      hiddenServices.clear();
+      storeServicePreferences();
+      renderServices();
+      renderSettings();
+    }, { className: 'settings-action' });
+    panel.append(servicesHeading, restore);
+  }
 }
 
 function settingsCheckbox(label, checked, onChange) {
@@ -491,19 +538,60 @@ function renderServices() {
   if (state.demo) {
     const note = document.createElement('div');
     note.className = 'banner';
-    note.textContent = 'Demo services on ports 9101–9103. Use Scan or a config file for your own services.';
+    note.textContent = 'Demo mode';
     root.append(note);
   }
   for (const service of state.services) {
+    if (hiddenServices.has(service.name)) continue;
     const pendingAction = pendingServiceActions.get(service.name)?.action;
     const indicator = serviceIndicator(service, pendingAction);
     const sharedRepo = service.repo
       && state.services.some((other) => other !== service && other.repo === service.repo);
-    const displayName = service.repo
+    const defaultDisplayName = service.repo
       ? `${service.repo}${sharedRepo ? ` · ${service.name}` : ''}`
       : `localhost:${service.port}`;
+    const displayName = serviceAliases[service.name] || defaultDisplayName;
     const card = document.createElement('div');
     card.className = logService === service.name ? 'service log-selected' : 'service';
+    const menuToggle = button('⋯', (event) => {
+      event.stopPropagation();
+      openServiceMenu = openServiceMenu === service.name ? null : service.name;
+      renderServices();
+    }, { className: 'service-menu-toggle' });
+    menuToggle.setAttribute('aria-label', `More actions for ${displayName}`);
+    menuToggle.setAttribute('aria-haspopup', 'menu');
+    menuToggle.setAttribute('aria-expanded', String(openServiceMenu === service.name));
+    if (openServiceMenu === service.name) {
+      const menu = document.createElement('div');
+      menu.className = 'service-menu';
+      menu.setAttribute('role', 'menu');
+      const remove = button('Remove', (event) => {
+        event.stopPropagation();
+        hiddenServices.add(service.name);
+        openServiceMenu = null;
+        if (logService === service.name) logService = null;
+        storeServicePreferences();
+        renderServices();
+        renderSettings();
+        renderLogs();
+      });
+      remove.setAttribute('role', 'menuitem');
+      remove.className = 'danger';
+      const rename = button('Rename', (event) => {
+        event.stopPropagation();
+        const value = window.prompt('Local service alias', serviceAliases[service.name] || defaultDisplayName);
+        if (value === null) return;
+        const alias = value.trim();
+        if (alias && alias !== defaultDisplayName) serviceAliases[service.name] = alias;
+        else delete serviceAliases[service.name];
+        openServiceMenu = null;
+        storeServicePreferences();
+        renderServices();
+      });
+      rename.setAttribute('role', 'menuitem');
+      menu.append(remove, rename);
+      card.append(menu);
+    }
     const row = document.createElement('div');
     row.className = 'row';
     row.classList.add('service-log-filter');
@@ -513,14 +601,13 @@ function renderServices() {
     name.className = 'name';
     const dot = document.createElement('i');
     dot.className = `dot status-${indicator.tone}`;
-    dot.title = indicator.label;
-    dot.setAttribute('aria-label', indicator.label);
+    const statusText = `${indicator.label} · localhost:${service.port}`;
+    dot.title = statusText;
+    dot.setAttribute('aria-label', statusText);
     name.append(dot, document.createTextNode(displayName));
     const meta = document.createElement('div');
     meta.className = 'meta';
-    meta.textContent = service.repo
-      ? `${indicator.label} · localhost:${service.port}`
-      : indicator.label;
+    meta.textContent = String(service.port);
     row.append(name);
     row.addEventListener('click', () => selectServiceLogs(service.name));
     row.addEventListener('keydown', (event) => {
@@ -539,7 +626,7 @@ function renderServices() {
     const footer = document.createElement('div');
     footer.className = 'service-footer';
     footer.append(meta, actions);
-    card.append(row, footer);
+    card.append(menuToggle, row, footer);
     root.append(card);
   }
 }
@@ -664,9 +751,12 @@ function renderDiagram() {
   if (!trace) {
     const empty = document.createElement('div');
     empty.className = 'empty';
-    empty.textContent = state.demo
-      ? 'Send the sample request to see the flow.'
-      : 'Start a configured service, or scan and attach to a running Node.js service.';
+    empty.textContent = sampleError
+      ? `Could not send the sample request: ${sampleError}`
+      : state.demo
+        ? 'Send the sample request to see the flow.'
+        : 'Start a configured service, or scan and attach to a running Node.js service.';
+    if (sampleError) empty.classList.add('error');
     root.append(empty);
     return;
   }
@@ -1083,11 +1173,20 @@ async function scanPorts() {
 }
 
 async function sendSample() {
-  await fetch(state.sampleUrl, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ message: 'hello', count: 2 }),
-  });
+  if (samplePending) return;
+  samplePending = true;
+  sampleError = '';
+  renderTransport();
+  renderDiagram();
+  try {
+    await post(state.sampleUrl);
+  } catch (error) {
+    sampleError = error.message || 'Request failed';
+  } finally {
+    samplePending = false;
+    renderTransport();
+    if (sampleError) renderDiagram();
+  }
 }
 
 $('clear').addEventListener('click', () => post('/api/clear'));
@@ -1098,6 +1197,10 @@ $('settings-toggle').addEventListener('click', () => {
   if (settingsOpen) $('settings-panel').querySelector('select, input')?.focus();
 });
 document.addEventListener('pointerdown', (event) => {
+  if (openServiceMenu && !event.target.closest('.service-menu, .service-menu-toggle')) {
+    openServiceMenu = null;
+    renderServices();
+  }
   if (!settingsOpen || event.target.closest('.settings')) return;
   settingsOpen = false;
   renderSettings();

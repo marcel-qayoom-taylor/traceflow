@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { attachToListener, listenerOn, listeners, listenersByPort, repositoryName, stopListener } from './attach.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -103,7 +103,7 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
       discovered,
       traces: [...traces.values()].sort((a, b) => b.startedAt - a.startedAt).slice(0, maxTraces),
       logEntries: [...logEntries],
-      sampleUrl: demo ? 'http://127.0.0.1:9101/request' : null,
+      sampleUrl: demo ? '/api/sample' : null,
     };
   }
 
@@ -778,6 +778,21 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
         noteLogsClear();
         return json(res, { ok: true });
       }
+      if (req.method === 'POST' && url.pathname === '/api/sample') {
+        if (!demo) return json(res, { error: 'sample request is only available in demo mode' }, 404);
+        const frontend = activeConfig.services.find((service) => service.name === 'frontend');
+        if (!frontend?.port) return json(res, { error: 'demo frontend is not configured' }, 503);
+        const response = await fetch(`http://127.0.0.1:${frontend.port}/request`, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'user-agent': 'Mozilla/5.0 Traceflow Demo',
+          },
+          body: JSON.stringify({ message: 'hello', count: 2 }),
+        });
+        const body = await response.text();
+        return json(res, { ok: response.ok, status: response.status, body }, response.ok ? 200 : 502);
+      }
       if (req.method === 'POST' && url.pathname === '/api/discovery/scan') {
         const result = scanListeners();
         return json(res, result, result.ok === false ? 500 : 200);
@@ -1104,7 +1119,7 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+const isMain = process.argv[1] && sameFile(process.argv[1], fileURLToPath(import.meta.url));
 if (isMain) {
   const demo = process.env.TRACEFLOW_DEMO === '1';
   const config = demo ? undefined : loadConfig();
@@ -1120,4 +1135,12 @@ if (isMain) {
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+}
+
+function sameFile(first, second) {
+  try {
+    return fs.realpathSync(first) === fs.realpathSync(second);
+  } catch {
+    return false;
+  }
 }

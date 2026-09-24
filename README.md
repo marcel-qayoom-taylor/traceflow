@@ -21,6 +21,19 @@ collector or send telemetry.
 
 ## Quick start
 
+Run without installing:
+
+```bash
+npx traceflow-debugger
+```
+
+Or install the `traceflow` command globally:
+
+```bash
+npm install --global traceflow-debugger
+traceflow
+```
+
 Run directly from a checkout:
 
 ```bash

@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { loadConfig, startServer } from './server.mjs';
@@ -11,6 +13,30 @@ test('configuration is optional when discovering local services', () => {
   const config = loadConfig({ cwd: '/traceflow/no-config-here', env: {} });
   assert.equal(config.port, 9477);
   assert.deepEqual(config.services, []);
+});
+
+test('npm-style symlink starts the CLI', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'traceflow-cli-'));
+  const executable = path.join(directory, 'traceflow');
+  const config = path.join(directory, 'traceflow.config.json');
+  fs.symlinkSync(path.resolve('src/server.mjs'), executable);
+  fs.writeFileSync(config, JSON.stringify({ port: 19993, services: [] }));
+  const child = spawn(executable, [], {
+    cwd: directory,
+    env: { ...process.env, TRACEFLOW_CONFIG: config },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', (chunk) => { output += chunk; });
+  child.stderr.on('data', (chunk) => { output += chunk; });
+  try {
+    await waitFor(() => output.includes('Traceflow at http://127.0.0.1:19993'));
+    const response = await fetch('http://127.0.0.1:19993/api/state');
+    assert.equal(response.status, 200);
+  } finally {
+    try { child.kill('SIGTERM'); } catch { /* already stopped */ }
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('live request becomes one three-hop trace', async () => {
@@ -67,6 +93,28 @@ test('live request becomes one three-hop trace', async () => {
       return next.traces.find((item) => item.spans.some((span) => span.path.startsWith('/inspector/device'))) || null;
     });
     assert.ok(debugTrace);
+  } finally {
+    await app.close();
+  }
+});
+
+test('demo sample request uses the same-origin API and captures the flow', async () => {
+  const config = trioConfig(0);
+  const app = await startServer({ port: 0, config, demo: true });
+  for (const service of config.services) app.startService(service.name);
+  try {
+    await waitHealth([9201, 9202, 9203]);
+    const state = await api(app, '/api/state');
+    assert.equal(state.sampleUrl, '/api/sample');
+    const sample = await api(app, state.sampleUrl, { method: 'POST', body: {} });
+    assert.equal(sample.ok, true);
+    assert.equal(sample.status, 200);
+    const trace = await waitFor(async () => {
+      const next = await api(app, '/api/state');
+      const found = next.traces.find((item) => item.spans.some((span) => span.path === '/request'));
+      return found?.spans.length === 3 ? found : null;
+    });
+    assert.deepEqual(trace.spans.map((span) => span.path).sort(), ['/lookup', '/process', '/request']);
   } finally {
     await app.close();
   }
