@@ -22,6 +22,20 @@ const DEFAULT_IGNORE = [
   'hot-update',
   '/sockjs-node',
 ];
+const SERVICE_COLORS = [
+  '#7dd3fc',
+  '#f9a8d4',
+  '#86efac',
+  '#fcd34d',
+  '#c4b5fd',
+  '#fdba74',
+  '#67e8f9',
+  '#fda4af',
+  '#bef264',
+  '#a5b4fc',
+  '#5eead4',
+  '#d8b4fe',
+];
 
 export async function startServer({ port = 9477, config, demo = false, limits } = {}) {
   const sessionToken = randomUUID();
@@ -113,7 +127,7 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
     return {
       name: service.name,
       port: service.port,
-      color: service.color || '#d6ff4a',
+      color: service.color || SERVICE_COLORS[activeConfig.services.indexOf(service) % SERVICE_COLORS.length],
       status: runtime?.status || 'stopped',
       pid: runtime?.pid || null,
       exitCode: runtime?.exitCode ?? null,
@@ -597,7 +611,6 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
     const service = {
       name: `localhost-${value}`,
       port: value,
-      color: '#8fb8ff',
       command: listener.command,
       repo: listener.repo,
       discovered: true,

@@ -15,6 +15,29 @@ test('configuration is optional when discovering local services', () => {
   assert.deepEqual(config.services, []);
 });
 
+test('services without configured colours receive distinct readable colours', async () => {
+  const app = await startServer({
+    port: 0,
+    config: {
+      include: [],
+      ignore: [],
+      services: [
+        { name: 'web', port: 19301, command: 'node web.js' },
+        { name: 'api', port: 19302, command: 'node api.js' },
+        { name: 'worker', port: 19303, command: 'node worker.js' },
+      ],
+    },
+  });
+  try {
+    const state = await api(app, '/api/state');
+    const colours = state.services.map((service) => service.color);
+    assert.equal(new Set(colours).size, colours.length);
+    assert.ok(colours.every((colour) => /^#[0-9a-f]{6}$/i.test(colour)));
+  } finally {
+    await app.close();
+  }
+});
+
 test('npm-style symlink starts the CLI', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'traceflow-cli-'));
   const executable = path.join(directory, 'traceflow');

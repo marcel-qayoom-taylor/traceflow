@@ -65,6 +65,19 @@ function storeServicePreferences() {
   localStorage.setItem(HIDDEN_SERVICES_KEY, JSON.stringify([...hiddenServices]));
 }
 
+function defaultServiceName(service) {
+  if (!service) return '';
+  const sharedRepo = service.repo
+    && state.services.some((other) => other !== service && other.repo === service.repo);
+  return service.repo
+    ? `${service.repo}${sharedRepo ? ` · ${service.name}` : ''}`
+    : `localhost:${service.port}`;
+}
+
+function serviceDisplayName(service) {
+  return serviceAliases[service.name] || defaultServiceName(service);
+}
+
 function rootSpan(trace) {
   return [...(trace?.spans || [])].sort((a, b) => a.startedAt - b.startedAt)[0] || null;
 }
@@ -534,6 +547,8 @@ function serviceIndicator(service, pendingAction) {
 
 function renderServices() {
   const root = $('services');
+  const hasAttachedService = state.services.some((service) => service.attached || service.agent);
+  $('scan-hint').hidden = hasAttachedService;
   root.replaceChildren();
   if (state.demo) {
     const note = document.createElement('div');
@@ -545,12 +560,8 @@ function renderServices() {
     if (hiddenServices.has(service.name)) continue;
     const pendingAction = pendingServiceActions.get(service.name)?.action;
     const indicator = serviceIndicator(service, pendingAction);
-    const sharedRepo = service.repo
-      && state.services.some((other) => other !== service && other.repo === service.repo);
-    const defaultDisplayName = service.repo
-      ? `${service.repo}${sharedRepo ? ` · ${service.name}` : ''}`
-      : `localhost:${service.port}`;
-    const displayName = serviceAliases[service.name] || defaultDisplayName;
+    const defaultDisplayName = defaultServiceName(service);
+    const displayName = serviceDisplayName(service);
     const card = document.createElement('div');
     card.className = logService === service.name ? 'service log-selected' : 'service';
     const menuToggle = button('⋯', (event) => {
@@ -587,6 +598,7 @@ function renderServices() {
         openServiceMenu = null;
         storeServicePreferences();
         renderServices();
+        renderLogs();
       });
       rename.setAttribute('role', 'menuitem');
       menu.append(remove, rename);
@@ -877,7 +889,8 @@ function renderInspector() {
 
 function renderLogs() {
   const title = $('log-title');
-  title.textContent = logService ? `${logService} logs` : 'All logs';
+  const selectedService = state.services.find((service) => service.name === logService);
+  title.textContent = selectedService ? `${serviceDisplayName(selectedService)} logs` : 'All logs';
   const entries = state.logEntries.filter((entry) => !logService || entry.service === logService);
   const view = $('log-view');
   view.replaceChildren();
@@ -886,9 +899,9 @@ function renderLogs() {
     line.className = 'log-line';
     const prefix = document.createElement('span');
     prefix.className = 'log-prefix';
-    prefix.textContent = `[${entry.service}]`;
     const service = state.services.find((item) => item.name === entry.service);
-    if (service) prefix.style.color = service.color;
+    prefix.textContent = `[${service ? serviceDisplayName(service) : entry.service}]`;
+    if (service?.color) prefix.style.color = service.color;
     line.append(prefix, document.createTextNode(` ${entry.line}`));
     view.append(line);
   }
@@ -1110,6 +1123,9 @@ function openScanModal() {
   scanModal = document.createElement('div');
   scanModal.id = 'scan-modal';
   scanModal.className = 'modal-backdrop';
+  scanModal.addEventListener('pointerdown', (event) => {
+    if (event.target === scanModal) closeScanModal();
+  });
   const dialog = document.createElement('div');
   dialog.className = 'scan-dialog';
   dialog.setAttribute('role', 'dialog');
