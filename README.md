@@ -13,6 +13,8 @@ details and service logs.
 Traceflow is designed for local development. It does not require a hosted
 collector or send telemetry.
 
+<img width="2560" height="1440" alt="Screenshot 2026-09-24 at 12 53 38 pm (2)" src="https://github.com/user-attachments/assets/6030c8fc-f2af-4908-bb89-f9a1685d6f31" />
+
 ## Requirements
 
 - Node.js 22 or newer
