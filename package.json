@@ -1,0 +1,47 @@
+{
+  "name": "traceflow",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Local sequence debugger for Node.js services",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/marcel-qayoom-taylor/traceflow.git"
+  },
+  "bugs": {
+    "url": "https://github.com/marcel-qayoom-taylor/traceflow/issues"
+  },
+  "homepage": "https://github.com/marcel-qayoom-taylor/traceflow#readme",
+  "bin": {
+    "traceflow": "src/server.mjs",
+    "traceflow-mcp": "src/mcp/server.mjs"
+  },
+  "files": [
+    "src/agent",
+    "src/attach.mjs",
+    "src/demo",
+    "src/mcp",
+    "src/public",
+    "src/server.mjs",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md",
+    "traceflow.config.example.json"
+  ],
+  "keywords": [
+    "debugger",
+    "distributed-tracing",
+    "nodejs",
+    "sequence-diagram",
+    "local-development"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "mcp": "node src/mcp/server.mjs",
+    "demo": "TRACEFLOW_DEMO=1 node src/server.mjs",
+    "test": "node --test src/selftest.mjs"
+  }
+}

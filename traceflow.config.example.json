@@ -1,0 +1,30 @@
+{
+  "port": 9477,
+  "ignore": [
+    "/health",
+    "/healthcheck",
+    "/ready",
+    "/metrics",
+    "/favicon.ico",
+    "/__webpack",
+    "hot-update",
+    "/sockjs-node"
+  ],
+  "include": [],
+  "services": [
+    {
+      "name": "web-app",
+      "cwd": "../web-app",
+      "command": "npm run dev",
+      "port": 3000,
+      "color": "#ffb25b"
+    },
+    {
+      "name": "api-service",
+      "cwd": "../api-service",
+      "command": "npm run dev",
+      "port": 8080,
+      "color": "#7ee0c6"
+    }
+  ]
+}

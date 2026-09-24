@@ -1,0 +1,23 @@
+name: Bug report
+description: Report reproducible Traceflow behaviour
+body:
+  - type: textarea
+    attributes:
+      label: What happened?
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Reproduction
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Traceflow and Node versions
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Operating system
+    validations:
+      required: true

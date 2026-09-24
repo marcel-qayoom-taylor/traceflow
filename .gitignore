@@ -1,0 +1,22 @@
+node_modules/
+.DS_Store
+*.log
+.playwright-mcp/
+
+# Local configuration and test output
+.env
+.env.*
+!.env.example
+coverage/
+.nyc_output/
+.cache/
+traceflow.config.json
+.traceflow-token
+scan-modal-check.png
+.codex/
+
+# Package-manager diagnostics
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
