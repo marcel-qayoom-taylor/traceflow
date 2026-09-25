@@ -457,7 +457,7 @@ test('manual port scan adds an opted-in Node listener', async () => {
 
 test('a live service card keeps its running light when attach cannot connect', async () => {
   const port = 9316;
-  const child = spawn('python3', ['-m', 'http.server', String(port), '--bind', '127.0.0.1'], { stdio: 'ignore' });
+  const child = spawnNonNode(port);
   const app = await startServer({
     port: 0,
     config: {
@@ -881,6 +881,26 @@ function postRaw(port, pathname, body) {
     req.setTimeout(8000, () => req.destroy(new Error(`timeout ${pathname}`)));
     req.end(body);
   });
+}
+
+function spawnNonNode(port) {
+  const script = `
+use IO::Socket::INET;
+my $server = IO::Socket::INET->new(
+  LocalHost => '127.0.0.1',
+  LocalPort => ${port},
+  Proto => 'tcp',
+  Listen => 8,
+  Reuse => 1,
+) or die $!;
+while (my $client = $server->accept()) {
+  my $buf = '';
+  $client->recv($buf, 1024);
+  $client->send("HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\nConnection: close\\r\\n\\r\\nOK");
+  $client->close();
+}
+`;
+  return spawn('perl', ['-e', script], { stdio: 'ignore' });
 }
 
 function spawnBare(port, options = {}) {
