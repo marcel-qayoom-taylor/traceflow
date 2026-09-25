@@ -40,9 +40,11 @@ const SERVICE_COLORS = [
 export async function startServer({ port = 9477, config, demo = false, limits } = {}) {
   const sessionToken = randomUUID();
   const activeConfig = config || (demo ? demoConfig() : loadConfig());
+  if (!demo) restoreRememberedServices(activeConfig);
   const control = {
     mode: 'run',
     pauseOnResponse: true,
+    captureBrowser: true,
     captureDebug: false,
     capture: 'all',
     include: activeConfig.include || [],
@@ -108,6 +110,13 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
     return peers;
   }
 
+  function listedTraces() {
+    const all = [...traces.values()].sort((a, b) => b.startedAt - a.startedAt);
+    const pinned = all.filter((trace) => trace.pinned);
+    const rest = all.filter((trace) => !trace.pinned).slice(0, Math.max(maxTraces - pinned.length, 0));
+    return [...pinned, ...rest].sort((a, b) => b.startedAt - a.startedAt);
+  }
+
   function snapshot() {
     return {
       demo,
@@ -115,7 +124,7 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
       gates: gates.map(gateView),
       services: activeConfig.services.map(serviceView),
       discovered,
-      traces: [...traces.values()].sort((a, b) => b.startedAt - a.startedAt).slice(0, maxTraces),
+      traces: listedTraces(),
       logEntries: [...logEntries],
       sampleUrl: demo ? '/api/sample' : null,
     };
@@ -174,13 +183,18 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
   function noteTraceMeta(trace) {
     if (dirty.clear) return;
     dirty.removed.delete(trace.id);
-    dirty.spans.set(`${trace.id}\0`, {
+    dirty.spans.set(`${trace.id}\0`, traceUpdate(trace, null));
+    scheduleDelta();
+  }
+
+  function traceUpdate(trace, span) {
+    return {
       traceId: trace.id,
       startedAt: trace.startedAt,
       spansTruncated: !!trace.spansTruncated,
-      span: null,
-    });
-    scheduleDelta();
+      pinned: !!trace.pinned,
+      span,
+    };
   }
 
   function noteRemoved(id) {
@@ -260,10 +274,16 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
     }
   }
 
-  function pushLog(service, line) {
+  function pushLog(service, line, meta = {}) {
     const clean = stripAnsi(String(line)).trimEnd();
     if (!clean) return;
-    const entry = { service, line: clean };
+    const entry = {
+      service,
+      line: clean,
+      at: Number.isFinite(meta.at) ? meta.at : Date.now(),
+    };
+    if (typeof meta.traceId === 'string' && meta.traceId) entry.traceId = meta.traceId;
+    if (typeof meta.spanId === 'string' && meta.spanId) entry.spanId = meta.spanId;
     logEntries.push(entry);
     if (logEntries.length > 900) logEntries.shift();
     pendingLogs.push(entry);
@@ -277,11 +297,21 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
     }, 80);
   }
 
+  function evictTraces() {
+    if (traces.size <= maxTraces) return;
+    const ranked = [...traces.values()].sort((a, b) => Number(a.pinned) - Number(b.pinned) || a.startedAt - b.startedAt);
+    for (const trace of ranked) {
+      if (traces.size <= maxTraces) return;
+      traces.delete(trace.id);
+      noteRemoved(trace.id);
+    }
+  }
+
   function expireTraces() {
     const now = Date.now();
     const held = new Set(gates.map((gate) => gate.traceId));
     for (const trace of [...traces.values()]) {
-      if (held.has(trace.id)) continue;
+      if (trace.pinned || held.has(trace.id)) continue;
       const updated = trace.updatedAt || trace.startedAt;
       const incomplete = trace.spans.some((span) => !span.endedAt);
       if (now - updated > (incomplete ? incompleteTtlMs : traceTtlMs)) {
@@ -301,13 +331,10 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
         updatedAt: event.at || Date.now(),
         spans: [],
         spansTruncated: false,
+        pinned: false,
       };
       traces.set(trace.id, trace);
-      while (traces.size > maxTraces) {
-        const oldest = [...traces.values()].sort((a, b) => a.startedAt - b.startedAt)[0];
-        traces.delete(oldest.id);
-        noteRemoved(oldest.id);
-      }
+      evictTraces();
     }
     trace.updatedAt = event.at || Date.now();
     let span = trace.spans.find((item) => item.id === event.spanId);
@@ -563,6 +590,7 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
     const runtime = runtimes.get(name);
     if (!spec || !runtime) return { ok: false, error: 'unknown service' };
     try {
+      const previousHello = agents.get(spec.name) || 0;
       const result = await attachToListener({
         port: spec.port,
         service: spec.name,
@@ -572,18 +600,31 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
         control,
         agentPath,
       });
+      if (result.ok && !(await waitForFreshAgent(spec.name, previousHello))) {
+        result.ok = false;
+        result.error = 'The agent loaded, but did not connect to Traceflow. Restart the service once, then attach again.';
+      }
       runtime.message = result.ok ? '' : result.error;
-      runtime.problem = result.ok ? '' : result.error;
+      runtime.problem = result.ok || runtime.status === 'running' ? '' : result.error;
       if (result.ok) runtime.attachedPid = result.pid;
       if (result.ok) pushLog(name, `[traceflow] attached to pid ${result.pid}`);
       noteServices();
       return result;
     } catch (err) {
       runtime.message = err.message;
-      runtime.problem = err.message;
+      runtime.problem = runtime.status === 'running' ? '' : err.message;
       noteServices();
       return { ok: false, error: err.message };
     }
+  }
+
+  async function waitForFreshAgent(name, previousHello, timeoutMs = 3000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if ((agents.get(name) || 0) > previousHello) return true;
+      await sleep(50);
+    }
+    return (agents.get(name) || 0) > previousHello;
   }
 
   function scanListeners() {
@@ -620,6 +661,7 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
       status: 'running', pid: listener.pid, exitCode: null, child: null, owner: 'terminal', attachedPid: null, message: 'Connecting to existing process…', problem: '', repo: listener.repo,
     });
     discovered = discovered.filter((item) => item.port !== value);
+    saveRememberedServices(activeConfig);
     noteServices();
     return attachService(service.name);
   }
@@ -678,11 +720,22 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
     if (event.type === 'hello') {
       const previous = agents.get(event.service) || 0;
       agents.set(event.service, Date.now());
-      if (Date.now() - previous > 5000) noteServices();
+      const runtime = runtimes.get(event.service);
+      let changed = Date.now() - previous > 5000;
+      if (runtime && (runtime.message || (runtime.problem && runtime.status === 'running'))) {
+        runtime.message = '';
+        if (runtime.status === 'running') runtime.problem = '';
+        changed = true;
+      }
+      if (changed) noteServices();
       return false;
     }
     if (event.type === 'log' && event.service && typeof event.line === 'string') {
-      pushLog(event.service, event.line);
+      pushLog(event.service, event.line, {
+        at: typeof event.at === 'number' ? event.at : undefined,
+        traceId: event.traceId,
+        spanId: event.spanId,
+      });
       return false;
     }
     if (event.type === 'span' && event.traceId && event.spanId) {
@@ -757,6 +810,7 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
         const body = await readJson(req);
         if (body.mode === 'run' || body.mode === 'step') control.mode = body.mode;
         if (typeof body.pauseOnResponse === 'boolean') control.pauseOnResponse = body.pauseOnResponse;
+        if (typeof body.captureBrowser === 'boolean') control.captureBrowser = body.captureBrowser;
         if (typeof body.captureDebug === 'boolean') control.captureDebug = body.captureDebug;
         if (['all', 'matched', 'armed', 'off'].includes(body.capture)) control.capture = body.capture;
         if (Array.isArray(body.include)) control.include = body.include.map(String).filter(Boolean);
@@ -779,6 +833,16 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
         control.mode = 'step';
         noteControl();
         return json(res, control);
+      }
+      const pinMatch = url.pathname.match(/^\/api\/traces\/([^/]+)\/pin$/);
+      if (req.method === 'POST' && pinMatch) {
+        const id = decodeURIComponent(pinMatch[1]);
+        const trace = traces.get(id);
+        if (!trace) return json(res, { error: 'unknown trace' }, 404);
+        const body = await readJson(req);
+        trace.pinned = Boolean(body.pinned);
+        noteTraceMeta(trace);
+        return json(res, { ok: true, id, pinned: trace.pinned });
       }
       if (req.method === 'POST' && url.pathname === '/api/clear') {
         traces.clear();
@@ -976,6 +1040,52 @@ function redactText(value) {
   return String(value || '')
     .replace(/((?:authorization|password|passcode|secret|token|access[-_]?token|refresh[-_]?token|api[-_]?key|session)["']?\s*[:=]\s*["']?)([^"'\s,&}]+)/gi, '$1[redacted]')
     .replace(/(bearer\s+)[a-z0-9._~+/-]+=*/gi, '$1[redacted]');
+}
+
+function rememberedServicesFile(config) {
+  if (!config?.baseDir) return null;
+  return path.join(config.baseDir, 'traceflow.services.json');
+}
+
+export function restoreRememberedServices(config) {
+  const file = rememberedServicesFile(config);
+  if (!file || !fs.existsSync(file)) return;
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return;
+  }
+  if (!Array.isArray(config.services)) config.services = [];
+  const ports = new Set(config.services.map((service) => Number(service.port)));
+  const names = new Set(config.services.map((service) => service.name));
+  for (const service of parsed.services || []) {
+    const port = Number(service?.port);
+    const name = String(service?.name || `localhost-${port}`);
+    if (!Number.isInteger(port) || port < 1 || port > 65535 || ports.has(port) || names.has(name)) continue;
+    ports.add(port);
+    names.add(name);
+    config.services.push({
+      name,
+      port,
+      command: service.command ? String(service.command) : '',
+      repo: service.repo || null,
+      discovered: true,
+    });
+  }
+}
+
+export function saveRememberedServices(config) {
+  const file = rememberedServicesFile(config);
+  if (!file) return;
+  const services = (config.services || []).filter((service) => service.discovered).map((service) => ({
+    name: service.name,
+    port: service.port,
+    command: service.command || '',
+    repo: service.repo || null,
+    discovered: true,
+  }));
+  fs.writeFileSync(file, `${JSON.stringify({ services }, null, 2)}\n`);
 }
 
 export function loadConfig({ cwd = process.cwd(), env = process.env } = {}) {

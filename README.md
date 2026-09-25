@@ -64,12 +64,16 @@ Everything stays on your machine and captured data is held in memory only.
 ## Features
 
 - Sequence diagrams for related incoming and outgoing HTTP requests
+- Browser-to-external fetch and XHR traces for attached local web apps
 - Request and response headers and bodies with sensitive values redacted
 - Pause, step, and resume controls for local requests
 - Explicit attachment to already-running Node.js processes
 - Optional service startup from a local config file
 - Listener discovery with repository badges
 - Collapsed bursts for repeated requests without discarding raw traces
+- Status, slow-hop, and pin filters, with failing and slowest hops marked on the diagram
+- Pins that keep a trace when older ones expire
+- Service logs linked to the request that wrote them
 - Local service logs and a read-only MCP diagnostics server
 
 ## Configuration
@@ -92,7 +96,8 @@ TRACEFLOW_CONFIG=./config/traceflow.json traceflow
 ```
 
 `traceflow.config.json` is ignored by Git because commands and environment
-values are normally machine-specific.
+values are normally machine-specific. Attached services are remembered in
+`traceflow.services.json`, next to that config, and restored on the next start.
 
 ## Security and privacy
 

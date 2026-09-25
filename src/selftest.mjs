@@ -15,6 +15,36 @@ test('configuration is optional when discovering local services', () => {
   assert.deepEqual(config.services, []);
 });
 
+test('attached services are restored from the local memory file', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'traceflow-services-'));
+  const remembered = path.join(directory, 'traceflow.services.json');
+  fs.writeFileSync(remembered, JSON.stringify({
+    services: [
+      { name: 'localhost-4101', port: 4101, command: 'node app.js', repo: 'app', discovered: true },
+      { name: 'api', port: 4102, command: 'node api.js', repo: 'api', discovered: true },
+    ],
+  }));
+  const app = await startServer({
+    port: 0,
+    config: {
+      baseDir: directory,
+      include: [],
+      ignore,
+      services: [{ name: 'api', port: 4102, command: 'node configured.js' }],
+    },
+  });
+  try {
+    const state = await api(app, '/api/state');
+    const names = state.services.map((service) => service.name).sort();
+    assert.deepEqual(names, ['api', 'localhost-4101']);
+    assert.equal(state.services.find((service) => service.name === 'api').command, 'node configured.js');
+    assert.equal(state.services.find((service) => service.name === 'localhost-4101').discovered, true);
+  } finally {
+    await app.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('services without configured colours receive distinct readable colours', async () => {
   const app = await startServer({
     port: 0,
@@ -248,6 +278,44 @@ test('existing node processes are only connected after an explicit attach', asyn
       return state.services.every((service) => service.agent) ? state : null;
     }, 15000);
     assert.equal(connected.services.every((service) => service.attached && !service.problem), true);
+    const page = await fetch('http://127.0.0.1:9311/page', {
+      headers: { accept: 'text/html', 'accept-encoding': 'br' },
+    }).then((response) => response.text());
+    assert.match(page, /<script src="\/__traceflow\/browser\.js"><\/script>/);
+    assert.match(page, /encoding: identity/);
+    const browserScript = await fetch('http://127.0.0.1:9311/__traceflow/browser.js');
+    assert.equal(browserScript.status, 200);
+    assert.match(await browserScript.text(), /__traceflowBrowserInstalled/);
+    const browserTraceId = 'browser-external-test';
+    const browserSpanId = 'browser-external-span';
+    for (const event of [
+      { phase: 'start', at: Date.now(), requestBody: '{"booking":true}' },
+      { phase: 'end', at: Date.now() + 12, status: 202, responseBody: '{"accepted":true}' },
+    ]) {
+      const response = await fetch('http://127.0.0.1:9311/__traceflow/browser-event', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', origin: 'http://localhost:9311' },
+        body: JSON.stringify({
+          type: 'span',
+          traceId: browserTraceId,
+          spanId: browserSpanId,
+          parentId: null,
+          from: 'spoofed',
+          to: 'cdn.example.test',
+          method: 'POST',
+          path: '/api/orders/guest-checkout',
+          ...event,
+        }),
+      });
+      assert.equal(response.status, 204);
+    }
+    const browserTrace = await waitFor(async () => {
+      const snapshot = await api(app, '/api/state');
+      return snapshot.traces.find((item) => item.id === browserTraceId) || null;
+    });
+    assert.equal(browserTrace.spans[0].from, 'browser');
+    assert.equal(browserTrace.spans[0].to, 'cdn.example.test');
+    assert.equal(browserTrace.spans[0].status, 202);
     await postJson(9311, '/alpha', { message: 'hello' });
     const trace = await waitFor(async () => {
       const snapshot = await api(app, '/api/state');
@@ -294,6 +362,69 @@ test('manual port scan adds an opted-in Node listener', async () => {
   } finally {
     try { process.kill(child.pid, 'SIGTERM'); } catch { /* already stopped */ }
     await app.close();
+  }
+});
+
+test('a live service card keeps its running light when attach cannot connect', async () => {
+  const port = 9316;
+  const child = spawn('python3', ['-m', 'http.server', String(port), '--bind', '127.0.0.1'], { stdio: 'ignore' });
+  const app = await startServer({
+    port: 0,
+    config: {
+      include: [],
+      ignore,
+      services: [{ name: 'svc-order', cwd: '.', port, command: 'echo svc-order' }],
+    },
+  });
+  try {
+    await waitFor(() => fetch(`http://127.0.0.1:${port}/`).then((response) => response.ok).catch(() => false));
+    const running = await waitFor(async () => {
+      const state = await api(app, '/api/state');
+      return state.services[0]?.status === 'running' ? state.services[0] : null;
+    });
+    assert.equal(running.problem, '');
+    assert.equal(running.agent, false);
+    const attached = await api(app, '/api/services/svc-order/attach', { method: 'POST', body: {} });
+    assert.equal(attached.ok, false);
+    const state = await api(app, '/api/state');
+    assert.equal(state.services[0].status, 'running');
+    assert.equal(state.services[0].problem, '');
+    assert.match(state.services[0].message, /not Node/);
+    assert.equal(state.services[0].agent, false);
+  } finally {
+    try { process.kill(child.pid, 'SIGTERM'); } catch { /* already stopped */ }
+    await app.close();
+  }
+});
+
+test('an attached agent reconnects after the Traceflow collector restarts', async () => {
+  const config = {
+    include: [],
+    ignore,
+    services: [{ name: 'reconnect-service', cwd: '.', port: 9315, command: 'echo reconnect-service' }],
+  };
+  const child = spawnBare(9315);
+  let first;
+  let second;
+  try {
+    await waitFor(() => postJson(9315, '/health', {}).then(() => true).catch(() => false));
+    first = await startServer({ port: 0, config });
+    await waitFor(async () => (await api(first, '/api/state')).services[0]?.status === 'running');
+    const initialAttach = await api(first, '/api/services/reconnect-service/attach', { method: 'POST', body: {} });
+    assert.equal(initialAttach.ok, true, initialAttach.error);
+    await waitFor(async () => (await api(first, '/api/state')).services[0]?.agent, 15000);
+    await first.close();
+    first = null;
+
+    second = await startServer({ port: 0, config });
+    await waitFor(async () => (await api(second, '/api/state')).services[0]?.status === 'running');
+    const reattach = await api(second, '/api/services/reconnect-service/attach', { method: 'POST', body: {} });
+    assert.equal(reattach.ok, true, reattach.error);
+    await waitFor(async () => (await api(second, '/api/state')).services[0]?.agent, 15000);
+  } finally {
+    if (first) await first.close();
+    if (second) await second.close();
+    try { process.kill(child.pid, 'SIGTERM'); } catch { /* already stopped */ }
   }
 });
 
@@ -423,6 +554,79 @@ test('traces keep a bounded span list and drop stale ones', async () => {
       body: `{"pad":"${'x'.repeat(MAX_JSON_PROBE)}"}`,
     });
     assert.equal(response.status, 413);
+  } finally {
+    await app.close();
+  }
+});
+
+test('pinned traces survive expiry and logs keep their trace', async () => {
+  const app = await startServer({
+    port: 0,
+    limits: { maxTraces: 3, incompleteTtlMs: 200, traceTtlMs: 200 },
+    config: {
+      include: [],
+      ignore,
+      services: [{ name: 'svc', cwd: '.', port: 19994, command: 'echo svc' }],
+    },
+  });
+  try {
+    const span = (traceId, at) => ({
+      type: 'span',
+      phase: 'end',
+      traceId,
+      spanId: `${traceId}-span`,
+      from: 'a',
+      to: 'svc',
+      method: 'GET',
+      path: `/${traceId}`,
+      status: 200,
+      at,
+    });
+    const started = Date.now();
+    await api(app, '/ingest', { method: 'POST', body: span('pin-me', started) });
+    const pinned = await api(app, '/api/traces/pin-me/pin', { method: 'POST', body: { pinned: true } });
+    assert.equal(pinned.pinned, true);
+    for (let i = 0; i < 4; i += 1) {
+      await api(app, '/ingest', { method: 'POST', body: span(`extra-${i}`, started + i + 1) });
+    }
+    const kept = await api(app, '/api/state');
+    assert.equal(kept.traces.length, 3);
+    assert.equal(kept.traces.find((trace) => trace.id === 'pin-me')?.pinned, true);
+
+    await sleep(250);
+    await api(app, '/ingest', { method: 'POST', body: { type: 'hello', service: 'svc' } });
+    const still = await api(app, '/api/state');
+    assert.equal(still.traces.some((trace) => trace.id === 'pin-me'), true);
+
+    await api(app, '/api/traces/pin-me/pin', { method: 'POST', body: { pinned: false } });
+    await sleep(250);
+    await api(app, '/ingest', { method: 'POST', body: { type: 'hello', service: 'svc' } });
+    const expired = await api(app, '/api/state');
+    assert.equal(expired.traces.some((trace) => trace.id === 'pin-me'), false);
+
+    const missing = await fetch(`${app.url}/api/traces/missing/pin`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-traceflow-token': app.token },
+      body: '{"pinned":true}',
+    });
+    assert.equal(missing.status, 404);
+
+    await api(app, '/ingest', {
+      method: 'POST',
+      body: {
+        type: 'log',
+        service: 'svc',
+        line: 'handled /alpha',
+        at: started,
+        traceId: 'pin-me',
+        spanId: 'pin-me-span',
+      },
+    });
+    const logged = await api(app, '/api/state');
+    const entry = logged.logEntries.find((item) => item.line === 'handled /alpha');
+    assert.equal(entry.traceId, 'pin-me');
+    assert.equal(entry.spanId, 'pin-me-span');
+    assert.equal(entry.at, started);
   } finally {
     await app.close();
   }
@@ -599,6 +803,11 @@ function spawnBare(port, options = {}) {
   const source = options.esm ? `
     import http from 'node:http';
     http.createServer((req, res) => {
+      if (req.url === '/page') {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+        res.end('<!doctype html><html><head><title>Local app</title></head><body>encoding: ' + req.headers['accept-encoding'] + '</body></html>');
+        return;
+      }
       const chunks = [];
       req.on('data', (chunk) => chunks.push(chunk));
       req.on('end', () => {
@@ -610,6 +819,11 @@ function spawnBare(port, options = {}) {
   ` : `
     const http = require('http');
     http.createServer((req, res) => {
+      if (req.url === '/page') {
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+        res.end('<!doctype html><html><head><title>Local app</title></head><body>encoding: ' + req.headers['accept-encoding'] + '</body></html>');
+        return;
+      }
       const chunks = [];
       req.on('data', (chunk) => chunks.push(chunk));
       req.on('end', () => {
@@ -619,7 +833,9 @@ function spawnBare(port, options = {}) {
       });
     }).listen(Number(process.env.PORT), '127.0.0.1');
   `;
-  const args = options.esm ? ['--input-type=module', '-e', source] : ['-e', source];
+  const args = options.esm
+    ? ['--inspect-port=0', '--input-type=module', '-e', source]
+    : ['--inspect-port=0', '-e', source];
   const child = spawn(process.execPath, args, { env, detached: true, stdio: 'ignore' });
   child.unref();
   return child;

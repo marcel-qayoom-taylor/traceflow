@@ -5,17 +5,19 @@
 
 const http = require('http');
 const https = require('https');
+const fs = require('fs');
+const path = require('path');
 const { AsyncLocalStorage } = require('async_hooks');
 const { randomUUID } = require('crypto');
 const { EventEmitter } = require('events');
 const { Readable } = require('stream');
 
-const SERVICE = process.env.TRACEFLOW_SERVICE;
+let SERVICE = process.env.TRACEFLOW_SERVICE;
 if (!SERVICE) return;
 
-const INGEST = process.env.TRACEFLOW_INGEST || 'http://127.0.0.1:9477';
-const TOKEN = process.env.TRACEFLOW_TOKEN || '';
-const ingestUrl = new URL(INGEST);
+let INGEST = process.env.TRACEFLOW_INGEST || 'http://127.0.0.1:9477';
+let TOKEN = process.env.TRACEFLOW_TOKEN || '';
+let ingestUrl = new URL(INGEST);
 const als = new AsyncLocalStorage();
 const MAX_STORE = 48_000;
 const MAX_BUFFER = 1_000_000;
@@ -24,12 +26,21 @@ const FLUSH_AT = 40;
 const FLUSH_MS = 50;
 const EVENT_QUEUE_MAX = 400;
 const INGEST_BATCH_BYTES = 1_500_000;
+const BROWSER_SCRIPT_PATH = '/__traceflow/browser.js';
+const BROWSER_EVENT_PATH = '/__traceflow/browser-event';
+let browserAgent = '';
+try {
+  browserAgent = fs.readFileSync(path.join(__dirname, 'browser.js'), 'utf8');
+} catch {
+  // Browser capture stays unavailable if the optional asset is missing.
+}
 
 const DEFAULT_IGNORE = ['/health', '/healthcheck', '/ready', '/metrics', '/favicon.ico'];
 
 let control = {
   mode: 'run',
   pauseOnResponse: true,
+  captureBrowser: true,
   captureDebug: false,
   capture: 'all',
   include: [],
@@ -54,12 +65,19 @@ try {
 const rawRequest = http.request;
 
 function install() {
+  const next = { service: SERVICE, ingest: INGEST, token: TOKEN, control, peers, browserAgent };
+  if (global.__traceflowAgentController?.reconfigure) {
+    global.__traceflowAgentController.reconfigure(next);
+    global.__traceflowAttachState = 'reconfigured';
+    return;
+  }
   if (global.__traceflowInstalled) {
-    patchOutput(process.stdout);
-    patchOutput(process.stderr);
+    global.__traceflowAttachState = 'restart-required';
     return;
   }
   global.__traceflowInstalled = true;
+  global.__traceflowAttachState = 'installed';
+  global.__traceflowAgentController = { reconfigure };
   patchModule(http);
   patchModule(https);
   patchFetch();
@@ -70,6 +88,24 @@ function install() {
   postNow({ type: 'hello', service: SERVICE });
   const hello = setInterval(() => postNow({ type: 'hello', service: SERVICE }), 2000);
   hello.unref();
+}
+
+function reconfigure(next) {
+  SERVICE = next.service || SERVICE;
+  INGEST = next.ingest || INGEST;
+  TOKEN = next.token || '';
+  ingestUrl = new URL(INGEST);
+  control = { ...control, ...(next.control || {}) };
+  peers = Array.isArray(next.peers) ? next.peers : peers;
+  if (next.browserAgent) browserAgent = next.browserAgent;
+  controlDelay = 1000;
+  if (controlReq) {
+    const previous = controlReq;
+    controlReq = null;
+    try { previous.destroy(); } catch { /* reconnecting */ }
+  }
+  scheduleControl(0);
+  postNow({ type: 'hello', service: SERVICE });
 }
 
 let controlReq = null;
@@ -249,7 +285,17 @@ function patchOutput(stream) {
         : String(chunk);
       const split = takeLogLines(rest, text);
       rest = split.rest;
-      for (const line of split.lines) postAsync({ type: 'log', service: SERVICE, line });
+      for (const line of split.lines) {
+        const ctx = store();
+        postAsync({
+          type: 'log',
+          service: SERVICE,
+          line,
+          at: Date.now(),
+          ...(ctx?.traceId ? { traceId: ctx.traceId } : {}),
+          ...(ctx?.spanId ? { spanId: ctx.spanId } : {}),
+        });
+      }
     } catch {
       // logging must never affect the service output stream
     }
@@ -1040,6 +1086,10 @@ function handleIncoming(server, originalEmit, req, res) {
   const path = req.url || '/';
   const method = String(req.method || 'GET').toUpperCase();
   const headers = headerObject(req.headers);
+  if (handleBrowserEndpoint(req, res, path, method, headers)) return true;
+  const browserDocument = headers['sec-fetch-dest'] === 'document'
+    || String(headers.accept || '').toLowerCase().includes('text/html');
+  if (control.captureBrowser && browserDocument) req.headers['accept-encoding'] = 'identity';
   const forced = headers['x-traceflow-capture'] === '1';
   if (method === 'OPTIONS' || (!forced && !pathAllowed(path))) {
     return originalEmit.call(server, 'request', req, res);
@@ -1109,6 +1159,57 @@ function handleIncoming(server, originalEmit, req, res) {
   return begin(start);
 }
 
+function handleBrowserEndpoint(req, res, requestPath, method, headers) {
+  const pathname = requestPath.split('?')[0];
+  if (method === 'GET' && pathname === BROWSER_SCRIPT_PATH) {
+    if (!browserAgent || !control.captureBrowser) {
+      res.writeHead(404);
+      res.end();
+      return true;
+    }
+    res.writeHead(200, {
+      'content-type': 'text/javascript; charset=utf-8',
+      'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff',
+    });
+    res.end(browserAgent);
+    return true;
+  }
+  if (method !== 'POST' || pathname !== BROWSER_EVENT_PATH) return false;
+  const origin = String(headers.origin || '');
+  const sameOrigin = headers['sec-fetch-site'] === 'same-origin';
+  const loopbackOrigin = /^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/i.test(origin);
+  if (!sameOrigin && !loopbackOrigin) {
+    res.writeHead(403);
+    res.end();
+    return true;
+  }
+  readAll(req).then((body) => {
+    try {
+      const event = JSON.parse(body.toString('utf8'));
+      if (control.captureBrowser && event?.type === 'span' && event.traceId && event.spanId && shouldCaptureOutbound(event.path)) {
+        postAsync({
+          ...event,
+          type: 'span',
+          from: 'browser',
+          to: String(event.to || 'external'),
+          method: String(event.method || 'GET').toUpperCase(),
+          path: String(event.path || '/'),
+        });
+      }
+      res.writeHead(204);
+      res.end();
+    } catch {
+      res.writeHead(400);
+      res.end();
+    }
+  }, () => {
+    res.writeHead(400);
+    res.end();
+  });
+  return true;
+}
+
 function incomingSource(headers) {
   if (headers['x-traceflow-from']) return headers['x-traceflow-from'];
   const userAgent = String(headers['user-agent'] || '').toLowerCase();
@@ -1142,6 +1243,25 @@ function wireServerResponse(res, ctx, isRoot) {
   const origSetHeader = res.setHeader.bind(res);
   const origWriteHead = res.writeHead.bind(res);
   let closed = false;
+  let browserInjected = false;
+  const injectBrowserAgent = (chunk, enc) => {
+    if (!isRoot || browserInjected || !browserAgent || !control.captureBrowser || chunk == null) return chunk;
+    const contentType = String(res.getHeader?.('content-type') || captured['content-type'] || '').toLowerCase();
+    const contentEncoding = String(res.getHeader?.('content-encoding') || captured['content-encoding'] || '').toLowerCase();
+    if (!contentType.includes('text/html') || contentEncoding) return chunk;
+    const wasBuffer = Buffer.isBuffer(chunk);
+    const text = wasBuffer ? chunk.toString(typeof enc === 'string' ? enc : 'utf8') : String(chunk);
+    const match = text.match(/<head(?:\s[^>]*)?>/i) || text.match(/<\/body\s*>/i);
+    if (!match) return chunk;
+    if (res.headersSent && res.getHeader?.('content-length')) return chunk;
+    const tag = `<script src="${BROWSER_SCRIPT_PATH}"></script>`;
+    const next = /^<head/i.test(match[0])
+      ? text.replace(match[0], `${match[0]}${tag}`)
+      : text.replace(match[0], `${tag}${match[0]}`);
+    browserInjected = true;
+    if (!res.headersSent) res.removeHeader?.('content-length');
+    return wasBuffer ? Buffer.from(next, typeof enc === 'string' ? enc : 'utf8') : next;
+  };
   res.setHeader = function setHeader(name, value) {
     captured[String(name).toLowerCase()] = Array.isArray(value) ? value.join(', ') : String(value);
     return origSetHeader(name, value);
@@ -1157,12 +1277,16 @@ function wireServerResponse(res, ctx, isRoot) {
   };
   res.write = function write(chunk, enc, cb) {
     if (chunk && typeof chunk !== 'function') cap.push(chunk, enc);
-    return origWrite(chunk, enc, cb);
+    return origWrite(injectBrowserAgent(chunk, enc), enc, cb);
   };
   res.end = function end(...args) {
     const chunk = typeof args[0] === 'function' ? undefined : args[0];
     if (chunk != null) cap.push(chunk);
-    const finish = () => origEnd(...args);
+    const finish = () => {
+      const outgoing = [...args];
+      if (chunk != null) outgoing[0] = injectBrowserAgent(chunk, typeof args[1] === 'string' ? args[1] : undefined);
+      return origEnd(...outgoing);
+    };
     if (closed) return finish();
     closed = true;
     const body = cap.payload(res.getHeader && res.getHeader('content-type'));

@@ -1,6 +1,6 @@
 const state = {
   demo: false,
-  control: { mode: 'run', pauseOnResponse: true, captureDebug: false, capture: 'all', include: [], ignore: [] },
+  control: { mode: 'run', pauseOnResponse: true, captureBrowser: true, captureDebug: false, capture: 'all', include: [], ignore: [] },
   gates: [],
   services: [],
   discovered: [],
@@ -13,7 +13,10 @@ let selectedSpanId = null;
 let selectedSpanKind = null;
 let follow = true;
 let logService = null;
+let logNote = '';
 let traceFilter = '';
+let traceFiltersOpen = false;
+const traceListFilters = { status: '', slow: false, pinned: false };
 let scanning = false;
 let scanNote = '';
 let scanQuery = '';
@@ -36,9 +39,16 @@ const MAIN_MIN_HEIGHT = 160;
 const INSPECTOR_WIDTH_KEY = 'traceflow.inspector-width';
 const SERVICE_ALIASES_KEY = 'traceflow.service-aliases';
 const HIDDEN_SERVICES_KEY = 'traceflow.hidden-services';
+const HIGHLIGHT_LOGS_KEY = 'traceflow.highlight-logs';
+let highlightRelatedLogs = localStorage.getItem(HIGHLIGHT_LOGS_KEY) !== '0';
 const INSPECTOR_MIN_WIDTH = 240;
 const STAGE_MIN_WIDTH = 360;
 const BURST_GAP_MS = 3000;
+const SLOW_MS = 500;
+const BUDGET_RATIO = 1.5;
+const MIN_BUDGET_MS = 20;
+const LOG_MATCH_PAD_MS = 1500;
+const HOP_LOG_LIMIT = 30;
 const serviceAliases = readStoredObject(SERVICE_ALIASES_KEY);
 const hiddenServices = new Set(readStoredArray(HIDDEN_SERVICES_KEY));
 
@@ -65,6 +75,14 @@ function storeServicePreferences() {
   localStorage.setItem(HIDDEN_SERVICES_KEY, JSON.stringify([...hiddenServices]));
 }
 
+function revealListeningServices(services) {
+  let changed = false;
+  for (const service of services) {
+    if (service.status === 'running' && hiddenServices.delete(service.name)) changed = true;
+  }
+  if (changed) storeServicePreferences();
+}
+
 function defaultServiceName(service) {
   if (!service) return '';
   const sharedRepo = service.repo
@@ -76,6 +94,157 @@ function defaultServiceName(service) {
 
 function serviceDisplayName(service) {
   return serviceAliases[service.name] || defaultServiceName(service);
+}
+
+function actorLabel(name) {
+  const service = state.services.find((item) => item.name === name);
+  if (!service) return { title: name, hint: '' };
+  const address = `localhost:${service.port}`;
+  const title = serviceAliases[service.name] || service.repo || address;
+  return { title, hint: title === address ? '' : address };
+}
+
+const ACTOR_FONT = '12px ui-monospace, "SF Mono", Menlo, monospace';
+const HINT_FONT = '10px ui-monospace, "SF Mono", Menlo, monospace';
+const ARROW_FONT = '11px ui-monospace, "SF Mono", Menlo, monospace';
+const ACTOR_MAX_WIDTH = 168;
+const ACTOR_MIN_PITCH = 112;
+const ACTOR_LABEL_GAP = 22;
+const ARROW_LABEL_PAD = 48;
+const TITLE_LINE = 15;
+const HINT_LINE = 13;
+
+function textWidth(text, font) {
+  const canvas = textWidth.canvas || (textWidth.canvas = document.createElement('canvas'));
+  const context = canvas.getContext('2d');
+  context.font = font;
+  return context.measureText(text).width;
+}
+
+function wrapDiagramLabel(text, maxWidth, font) {
+  if (textWidth(text, font) <= maxWidth) return [text];
+  const tokens = text.split(/(?<=[./:_-])|\s+/).filter(Boolean);
+  const lines = [];
+  let line = '';
+  const pushHard = (token) => {
+    let rest = token;
+    while (textWidth(rest, font) > maxWidth) {
+      let cut = rest.length - 1;
+      while (cut > 1 && textWidth(rest.slice(0, cut), font) > maxWidth) cut -= 1;
+      lines.push(rest.slice(0, cut));
+      rest = rest.slice(cut);
+    }
+    return rest;
+  };
+  for (const token of tokens) {
+    const next = line ? `${line}${token}` : token;
+    if (textWidth(next, font) <= maxWidth) {
+      line = next;
+      continue;
+    }
+    if (line) lines.push(line);
+    line = textWidth(token, font) > maxWidth ? pushHard(token) : token;
+  }
+  if (line) lines.push(line);
+  return lines.length ? lines : [text];
+}
+
+function spanDuration(span) {
+  return span?.endedAt ? span.endedAt - span.startedAt : null;
+}
+
+function spanIsBad(span) {
+  return Boolean(span?.error) || (span?.status != null && Number(span.status) >= 400);
+}
+
+function budgetSpanId(spans) {
+  const completed = (spans || [])
+    .map((span) => ({ id: span.id, ms: spanDuration(span) }))
+    .filter((span) => span.ms != null)
+    .sort((a, b) => b.ms - a.ms);
+  const [top, next] = completed;
+  if (!top || top.ms === next?.ms) return null;
+  if (top.ms >= SLOW_MS) return top.id;
+  if (next && top.ms >= next.ms * BUDGET_RATIO && top.ms >= MIN_BUDGET_MS) return top.id;
+  return null;
+}
+
+function spanMarks(span, budgetId) {
+  return { bad: spanIsBad(span), budget: Boolean(budgetId) && span?.id === budgetId };
+}
+
+function traceProblems(trace) {
+  const spans = trace?.spans || [];
+  return {
+    bad: spans.some(spanIsBad),
+    slow: spans.some((span) => (spanDuration(span) ?? 0) >= SLOW_MS),
+  };
+}
+
+function diagramArrowText(span, kind, marks = {}) {
+  if (kind === 'request') return `${span.method} ${shortPath(span.path)}`;
+  const duration = spanDuration(span);
+  const note = marks.bad ? '  error' : marks.budget ? '  slowest' : '';
+  return `${span.status ?? '…'}${duration == null ? '' : `  ${duration}ms`}${note}`;
+}
+
+function layoutDiagramActors(actors, spans = [], budgetId = null) {
+  const laid = actors.map((actor) => {
+    const titleLines = wrapDiagramLabel(actor.title, ACTOR_MAX_WIDTH, ACTOR_FONT);
+    const hintLines = actor.hint ? wrapDiagramLabel(actor.hint, ACTOR_MAX_WIDTH, HINT_FONT) : [];
+    const labelWidth = Math.max(
+      0,
+      ...titleLines.map((line) => textWidth(line, ACTOR_FONT)),
+      ...hintLines.map((line) => textWidth(line, HINT_FONT)),
+    );
+    return { ...actor, titleLines, hintLines, labelWidth };
+  });
+  laid.forEach((actor, index) => {
+    const service = state.services.some((item) => item.name === actor.name);
+    const left = actor.labelWidth / 2 + (service ? 14 : 0);
+    const right = actor.labelWidth / 2;
+    if (!index) {
+      actor.x = 16 + left;
+    } else {
+      const previous = laid[index - 1];
+      const pitch = Math.max(ACTOR_MIN_PITCH, previous.right + ACTOR_LABEL_GAP + left);
+      actor.x = previous.x + pitch;
+    }
+    actor.left = left;
+    actor.right = right;
+  });
+  const indexOf = new Map(laid.map((actor, index) => [actor.name, index]));
+  for (const span of spans) {
+    const from = indexOf.get(span.from);
+    const to = indexOf.get(span.to);
+    if (from == null || to == null || from === to) continue;
+    const left = Math.min(from, to);
+    const right = Math.max(from, to);
+    const marks = spanMarks(span, budgetId);
+    const labelWidth = Math.max(
+      textWidth(diagramArrowText(span, 'request', marks), ARROW_FONT),
+      textWidth(diagramArrowText(span, 'response', marks), ARROW_FONT),
+    ) + ARROW_LABEL_PAD;
+    const distance = laid[right].x - laid[left].x;
+    if (distance >= labelWidth) continue;
+    const extra = labelWidth - distance;
+    for (let index = right; index < laid.length; index += 1) laid[index].x += extra;
+  }
+  const titleY = 16;
+  for (const actor of laid) {
+    actor.hintY = titleY + actor.titleLines.length * TITLE_LINE + 1;
+    const blockBottom = actor.hintLines.length
+      ? actor.hintY + (actor.hintLines.length - 1) * HINT_LINE
+      : titleY + (actor.titleLines.length - 1) * TITLE_LINE;
+    actor.blockBottom = blockBottom;
+  }
+  const last = laid[laid.length - 1];
+  return {
+    laid,
+    width: last ? last.x + last.right + 28 : 1,
+    titleY,
+    lineY: Math.max(titleY, ...laid.map((actor) => actor.blockBottom)) + 14,
+  };
 }
 
 function rootSpan(trace) {
@@ -230,7 +399,11 @@ function initializeInspectorResizer() {
     event.preventDefault();
     setInspectorWidth(next, true);
   });
-  window.addEventListener('resize', () => setInspectorWidth(parseInt(getComputedStyle(document.documentElement).getPropertyValue('--inspector-width'), 10)));
+  window.addEventListener('resize', () => {
+    setInspectorWidth(parseInt(getComputedStyle(document.documentElement).getPropertyValue('--inspector-width'), 10));
+    const svg = $('diagram')?.querySelector('svg');
+    if (svg && !diagramView.userMoved) placeDiagram(svg);
+  });
 }
 
 let renderScheduled = false;
@@ -241,6 +414,7 @@ function connect() {
   source.addEventListener('snapshot', (event) => {
     const data = JSON.parse(event.data);
     Object.assign(state, data, { control: { ...state.control, ...data.control } });
+    revealListeningServices(state.services);
     settlePendingServiceActions();
     scheduleRender({ chrome: true, traces: true, logs: true });
   });
@@ -276,7 +450,9 @@ function applyDelta(data) {
     chrome = true;
   }
   if (data.services) {
+    const previous = new Set(state.services.map((service) => service.name));
     state.services = data.services;
+    revealListeningServices(state.services.filter((service) => !previous.has(service.name)));
     settlePendingServiceActions();
     chrome = true;
     traces = true;
@@ -324,11 +500,13 @@ function applySpanUpdate(update) {
       startedAt: update.startedAt,
       spans: [],
       spansTruncated: !!update.spansTruncated,
+      pinned: !!update.pinned,
     };
     state.traces.unshift(trace);
   }
   trace.startedAt = update.startedAt || trace.startedAt;
   if (update.spansTruncated) trace.spansTruncated = true;
+  if (!update.span && 'pinned' in update) trace.pinned = !!update.pinned;
   if (!update.span) return;
   const index = trace.spans.findIndex((item) => item.id === update.span.id);
   if (index >= 0) {
@@ -374,7 +552,10 @@ function flushRender() {
     renderDiagram();
     renderInspector();
   }
-  if (logs) renderLogs();
+  if (logs) {
+    renderLogs({ stickToEnd: true });
+    if (selectedTraceId) renderInspector();
+  }
 }
 
 async function post(url, body) {
@@ -435,10 +616,16 @@ function renderTransport() {
   const root = $('transport');
   root.replaceChildren();
   const paused = state.control.mode === 'step';
+  const held = state.gates.length > 0;
+  const step = button('Step', () => post('/api/step'), {
+    className: paused && held ? 'primary' : '',
+    disabled: !paused || !held,
+  });
+  if (!paused) step.title = 'Pause to step through requests';
+  else if (!held) step.title = 'Nothing is held';
   root.append(
-    button(paused ? 'Paused' : 'Pause', () => post('/api/pause'), { on: String(paused) }),
-    button('Step', () => post('/api/step'), { className: 'primary' }),
-    button('Resume', () => post('/api/resume')),
+    paused ? button('Resume', () => post('/api/resume'), { className: held ? '' : 'primary' }) : button('Pause', () => post('/api/pause')),
+    step,
   );
   if (state.demo && state.sampleUrl) {
     const sample = button(samplePending ? 'Sending sample…' : 'Send sample request', sendSample, {
@@ -482,6 +669,13 @@ function renderSettings() {
   const debugNote = document.createElement('div');
   debugNote.className = 'settings-note';
   debugNote.textContent = 'Includes /message and /inspector/* requests.';
+  const browserRow = settingsCheckbox('Capture browser traffic', Boolean(state.control.captureBrowser), (checked) => {
+    state.control.captureBrowser = checked;
+    void post('/api/control', { captureBrowser: checked });
+  });
+  const browserNote = document.createElement('div');
+  browserNote.className = 'settings-note';
+  browserNote.textContent = 'Captures external fetch and XHR calls from attached local web apps. Reload the app after enabling.';
 
   const playbackHeading = document.createElement('div');
   playbackHeading.className = 'settings-heading';
@@ -493,8 +687,16 @@ function renderSettings() {
     follow = checked;
     if (follow) scheduleRender({ traces: true });
   });
+  const displayHeading = document.createElement('div');
+  displayHeading.className = 'settings-heading';
+  displayHeading.textContent = 'Display';
+  const highlightRow = settingsCheckbox('Highlight related logs', highlightRelatedLogs, (checked) => {
+    highlightRelatedLogs = checked;
+    localStorage.setItem(HIGHLIGHT_LOGS_KEY, checked ? '1' : '0');
+    renderLogs();
+  });
 
-  panel.append(captureHeading, captureRow, debugRow, debugNote, playbackHeading, responseRow, followRow);
+  panel.append(captureHeading, captureRow, browserRow, browserNote, debugRow, debugNote, playbackHeading, responseRow, followRow, displayHeading, highlightRow);
   if (hiddenServices.size) {
     const servicesHeading = document.createElement('div');
     servicesHeading.className = 'settings-heading';
@@ -523,9 +725,6 @@ function settingsCheckbox(label, checked, onChange) {
 }
 
 function serviceIndicator(service, pendingAction) {
-  if (service.problem || service.status === 'exited') {
-    return { tone: 'red', label: service.problem || 'Process exited' };
-  }
   if (pendingAction || service.status === 'stopping') {
     const action = pendingAction || 'stop';
     return { tone: 'yellow', label: `${action[0].toUpperCase()}${action.slice(1)}ing…` };
@@ -533,14 +732,14 @@ function serviceIndicator(service, pendingAction) {
   if (service.status === 'running' && service.agent) {
     return { tone: 'green', label: 'Running and attached' };
   }
-  if (service.attached) {
-    return {
-      tone: 'yellow',
-      label: service.status === 'running' ? 'Attached, waiting for agent' : 'Attached, not running',
-    };
+  if (service.status === 'running' && service.attached) {
+    return { tone: 'yellow', label: 'Attached, waiting for agent' };
   }
   if (service.status === 'running') {
     return { tone: 'yellow', label: 'Running, not attached' };
+  }
+  if (service.problem || service.status === 'exited') {
+    return { tone: 'red', label: service.problem || 'Process exited' };
   }
   return { tone: 'grey', label: 'Stopped, not attached' };
 }
@@ -614,7 +813,8 @@ function renderServices() {
     const dot = document.createElement('i');
     dot.className = `dot status-${indicator.tone}`;
     const statusText = `${indicator.label} · localhost:${service.port}`;
-    dot.title = statusText;
+    const attachNote = service.status === 'running' && !service.agent ? (service.problem || service.message) : '';
+    dot.title = attachNote ? `${statusText}. ${attachNote}` : statusText;
     dot.setAttribute('aria-label', statusText);
     name.append(dot, document.createTextNode(displayName));
     const meta = document.createElement('div');
@@ -632,7 +832,7 @@ function renderServices() {
     actions.className = 'actions';
     actions.append(
       button(pendingAction === 'start' ? 'Starting…' : 'Start', () => { void runServiceAction(service, 'start'); }, { disabled: Boolean(pendingAction) || service.status === 'running' }),
-      button(pendingAction === 'attach' ? 'Attaching…' : 'Attach', () => { void runServiceAction(service, 'attach'); }, { disabled: Boolean(pendingAction) || service.status !== 'running' || service.owner !== 'terminal' || service.attached }),
+      button(pendingAction === 'attach' ? 'Attaching…' : 'Attach', () => { void runServiceAction(service, 'attach'); }, { disabled: Boolean(pendingAction) || service.status !== 'running' || service.owner !== 'terminal' || service.agent }),
       button(pendingAction === 'stop' ? 'Stopping…' : 'Stop', () => { void runServiceAction(service, 'stop'); }, { disabled: Boolean(pendingAction) || service.status !== 'running' }),
     );
     const footer = document.createElement('div');
@@ -661,6 +861,13 @@ function renderTraces() {
     root.append(empty);
     return;
   }
+  const pinned = traces.filter((trace) => trace.pinned);
+  const rest = traces.filter((trace) => !trace.pinned);
+  if (pinned.length) appendTraceGroups(root, pinned);
+  appendTraceGroups(root, rest);
+}
+
+function appendTraceGroups(root, traces) {
   for (const group of groupTraceBursts(traces)) {
     if (group.traces.length === 1) {
       root.append(traceButton(group.traces[0]));
@@ -694,38 +901,130 @@ function renderTraces() {
 
 function traceButton(trace, child = false) {
   const summary = traceListMeta(trace);
-  const item = document.createElement('button');
-  item.type = 'button';
-  item.className = `${trace.id === selectedTraceId ? 'trace active' : 'trace'}${child ? ' trace-child' : ''}`;
+  const problems = traceProblems(trace);
+  const card = document.createElement('div');
+  card.className = trace.id === selectedTraceId ? 'trace active' : 'trace';
+  if (child) card.classList.add('trace-child');
+  if (trace.pinned) card.classList.add('pinned');
+  if (problems.bad) card.classList.add('problem');
+  else if (problems.slow) card.classList.add('slow');
+  const pin = button('', (event) => {
+    event.stopPropagation();
+    togglePin(trace);
+  }, { className: trace.pinned ? 'pin-toggle on' : 'pin-toggle' });
+  pin.append(pinGlyph(trace.pinned));
+  pin.setAttribute('aria-label', trace.pinned ? 'Unpin trace' : 'Pin trace');
+  pin.title = trace.pinned ? 'Unpin this trace' : 'Keep this trace on screen';
+  pin.setAttribute('aria-pressed', String(Boolean(trace.pinned)));
+  const head = document.createElement('div');
+  head.className = 'trace-head';
+  const method = document.createElement('span');
+  method.className = 'trace-method';
+  method.textContent = summary.method;
+  head.append(method);
   const title = document.createElement('div');
   title.className = 'trace-title';
-  title.textContent = `${summary.method} ${summary.path}`;
+  title.textContent = summary.path;
+  title.title = summary.path;
   const meta = document.createElement('div');
   meta.className = 'meta';
-  meta.textContent = `${summary.status ?? 'live'} · ${formatTraceTime(summary.startedAt)}`;
+  const bits = [summary.status ?? 'live'];
+  if (problems.slow) bits.push('slow');
+  bits.push(formatTraceTime(summary.startedAt));
+  meta.textContent = bits.join(' · ');
   meta.title = meta.textContent;
-  item.append(title, meta);
-  item.addEventListener('click', () => {
-    follow = false;
-    selectedTraceId = trace.id;
-    selectedSpanId = null;
-    selectedSpanKind = null;
-    renderTraces();
-    renderDiagram();
-    renderInspector();
+  card.append(pin, head, title, meta);
+  card.addEventListener('click', (event) => {
+    if (event.target.closest('.pin-toggle')) return;
+    selectTrace(trace.id);
   });
-  return item;
+  return card;
+}
+
+const PIN_PATH = 'M16 9V4h1c.55 0 1-.45 1-1s-.45-1-1-1H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3z';
+const PIN_OUTLINE_PATH = 'M14 4v5c0 1.12.37 2.16 1 3H9c.65-.86 1-1.9 1-3V4zm3-2H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3V4h1c.55 0 1-.45 1-1s-.45-1-1-1z';
+
+function pinGlyph(filled) {
+  const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  icon.setAttribute('viewBox', '0 0 24 24');
+  icon.setAttribute('aria-hidden', 'true');
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('d', filled ? PIN_PATH : PIN_OUTLINE_PATH);
+  path.setAttribute('fill', 'currentColor');
+  icon.append(path);
+  return icon;
+}
+
+function togglePin(trace) {
+  const pinned = !trace.pinned;
+  trace.pinned = pinned;
+  follow = false;
+  selectedTraceId = trace.id;
+  renderTraces();
+  renderDiagram();
+  renderInspector();
+  void post(`/api/traces/${encodeURIComponent(trace.id)}/pin`, { pinned }).catch(() => {
+    trace.pinned = !pinned;
+    renderTraces();
+  });
+}
+
+function selectTrace(traceId, spanId = null, kind = null) {
+  follow = false;
+  logNote = '';
+  selectedTraceId = traceId;
+  selectedSpanId = spanId;
+  selectedSpanKind = kind;
+  renderTraces();
+  renderDiagram();
+  renderInspector();
+  renderLogs({ revealRelated: true });
+}
+
+function shownTrace(traceId = selectedTraceId) {
+  const trace = state.traces.find((item) => item.id === traceId);
+  if (!trace || !isListedTrace(trace)) return null;
+  return trace;
+}
+
+function selectedSpan(trace = shownTrace()) {
+  if (!trace) return null;
+  return trace.spans.find((span) => span.id === selectedSpanId) || trace.spans[0] || null;
+}
+
+function isListedTrace(trace) {
+  return state.control.captureDebug || !isDebuggerTrace(trace);
 }
 
 function formatTraceTime(value) {
   return new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
+function statusClass(status) {
+  const code = Number(status);
+  if (!Number.isInteger(code) || code < 100 || code > 599) return '';
+  return `${Math.floor(code / 100)}xx`;
+}
+
+function traceMatchesFilters(trace) {
+  if (traceListFilters.status && !(trace.spans || []).some((span) => statusClass(span.status) === traceListFilters.status)) return false;
+  if (traceListFilters.slow && !traceProblems(trace).slow) return false;
+  if (traceListFilters.pinned && !trace.pinned) return false;
+  return true;
+}
+
+function syncTraceFilters() {
+  const toggle = $('trace-filters-toggle');
+  const active = Boolean(traceListFilters.status || traceListFilters.slow || traceListFilters.pinned);
+  toggle.textContent = '▾';
+  toggle.setAttribute('aria-expanded', String(traceFiltersOpen));
+  toggle.classList.toggle('has-filters', active);
+  $('trace-filters').hidden = !traceFiltersOpen;
+}
+
 function filteredTraces() {
   const input = $('trace-search');
-  const visible = state.control.captureDebug
-    ? state.traces
-    : state.traces.filter((trace) => !isDebuggerTrace(trace));
+  let visible = state.traces.filter(isListedTrace).filter(traceMatchesFilters);
   if (!traceFilter) {
     input.removeAttribute('aria-invalid');
     return visible;
@@ -756,9 +1055,96 @@ function renderHeld() {
   root.append(label);
 }
 
+const diagramView = { x: 0, y: 0, scale: 1, traceId: null, userMoved: false };
+let diagramDrag = null;
+
+function fitDiagram(svg) {
+  const root = $('diagram');
+  const viewWidth = root.clientWidth;
+  const viewHeight = root.clientHeight;
+  const contentWidth = svg.width.baseVal.value;
+  const contentHeight = svg.height.baseVal.value;
+  if (!viewWidth || !viewHeight || !contentWidth || !contentHeight) return;
+  const fit = Math.min((viewWidth - 80) / contentWidth, (viewHeight - 80) / contentHeight);
+  const scale = Math.min(Math.max(fit, 1), 2.2) * 0.8;
+  diagramView.scale = scale;
+  diagramView.x = (viewWidth - contentWidth * scale) / 2;
+  diagramView.y = contentHeight * scale < viewHeight - 48
+    ? (viewHeight - contentHeight * scale) / 2
+    : 28;
+}
+
+function applyDiagramTransform(svg = $('diagram').querySelector('svg')) {
+  if (!svg) return;
+  svg.style.transform = `translate(${diagramView.x}px, ${diagramView.y}px) scale(${diagramView.scale})`;
+}
+
+function placeDiagram(svg) {
+  if (!svg.isConnected) return;
+  if (!$('diagram').clientWidth || !$('diagram').clientHeight) {
+    requestAnimationFrame(() => placeDiagram(svg));
+    return;
+  }
+  if (!diagramView.userMoved) fitDiagram(svg);
+  applyDiagramTransform(svg);
+}
+
+function bindDiagramViewport() {
+  const root = $('diagram');
+  root.addEventListener('wheel', (event) => {
+    const svg = root.querySelector('svg');
+    if (!svg) return;
+    event.preventDefault();
+    const rect = root.getBoundingClientRect();
+    const pointerX = event.clientX - rect.left;
+    const pointerY = event.clientY - rect.top;
+    const next = Math.min(2.6, Math.max(0.4, diagramView.scale * Math.exp(-event.deltaY * 0.0015)));
+    const ratio = next / diagramView.scale;
+    diagramView.x = pointerX - (pointerX - diagramView.x) * ratio;
+    diagramView.y = pointerY - (pointerY - diagramView.y) * ratio;
+    diagramView.scale = next;
+    diagramView.userMoved = true;
+    applyDiagramTransform(svg);
+  }, { passive: false });
+  root.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0 || !root.querySelector('svg')) return;
+    if (event.target.closest('.hit')) return;
+    diagramDrag = {
+      id: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+      originX: diagramView.x,
+      originY: diagramView.y,
+      moved: false,
+    };
+  });
+  root.addEventListener('pointermove', (event) => {
+    if (!diagramDrag || diagramDrag.id !== event.pointerId) return;
+    const dx = event.clientX - diagramDrag.x;
+    const dy = event.clientY - diagramDrag.y;
+    if (!diagramDrag.moved && Math.hypot(dx, dy) < 5) return;
+    if (!diagramDrag.moved) {
+      try { root.setPointerCapture(event.pointerId); } catch { /* drag still tracks if capture is unavailable */ }
+    }
+    diagramDrag.moved = true;
+    diagramView.userMoved = true;
+    diagramView.x = diagramDrag.originX + dx;
+    diagramView.y = diagramDrag.originY + dy;
+    root.classList.add('panning');
+    applyDiagramTransform();
+  });
+  const endDrag = (event) => {
+    if (!diagramDrag || diagramDrag.id !== event.pointerId) return;
+    diagramDrag = null;
+    root.classList.remove('panning');
+  };
+  root.addEventListener('pointerup', endDrag);
+  root.addEventListener('pointercancel', endDrag);
+}
+
 function renderDiagram() {
   const root = $('diagram');
-  const trace = filteredTraces().find((item) => item.id === selectedTraceId);
+  const trace = shownTrace();
   root.replaceChildren();
   if (!trace) {
     const empty = document.createElement('div');
@@ -775,8 +1161,6 @@ function renderDiagram() {
   const spans = [...trace.spans].sort((a, b) => a.startedAt - b.startedAt);
   const names = [];
   const add = (name) => { if (name && !names.includes(name)) names.push(name); };
-  add('browser');
-  for (const service of state.services) add(service.name);
   for (const span of spans) { add(span.from); add(span.to); }
   const rows = [];
   for (const span of spans) {
@@ -785,34 +1169,40 @@ function renderDiagram() {
       rows.push({ kind: 'response', span });
     }
   }
-  const col = 180;
-  const width = Math.max(names.length * col + 40, 640);
-  const height = 64 + rows.length * 48;
+  const budgetId = budgetSpanId(spans);
+  const actors = names.map((name) => ({ name, ...actorLabel(name) }));
+  const layout = layoutDiagramActors(actors, spans, budgetId);
+  const rowStart = layout.lineY + 46;
+  const height = rowStart + 6 + rows.length * 48;
+  const { width } = layout;
   const svg = svgEl('svg', { width, height, viewBox: `0 0 ${width} ${height}` });
-  const xOf = (name) => 28 + names.indexOf(name) * col + col / 2;
-  names.forEach((name, index) => {
-    const x = xOf(name);
-    const service = state.services.find((item) => item.name === name);
-    svg.append(svgEl('text', { class: 'actor', x, y: 22, 'text-anchor': 'middle' }, name));
-    svg.append(svgEl('line', { class: 'lifeline', x1: x, x2: x, y1: 32, y2: height - 10 }));
+  const xOf = (name) => layout.laid.find((actor) => actor.name === name)?.x ?? 0;
+  layout.laid.forEach((actor) => {
+    const x = actor.x;
+    const service = state.services.find((item) => item.name === actor.name);
+    svg.append(diagramText('actor', x, layout.titleY, actor.titleLines, TITLE_LINE));
+    if (actor.hintLines.length) svg.append(diagramText('actor-hint', x, actor.hintY, actor.hintLines, HINT_LINE));
+    svg.append(svgEl('line', { class: 'lifeline', x1: x, x2: x, y1: layout.lineY, y2: height - 10 }));
     if (service) {
-      svg.append(svgEl('circle', { cx: x - (name.length * 3.4) - 10, cy: 18, r: 4, fill: service.color }));
+      const firstLine = textWidth(actor.titleLines[0], ACTOR_FONT);
+      svg.append(svgEl('circle', { cx: x - firstLine / 2 - 10, cy: layout.titleY - 4, r: 4, fill: service.color }));
     }
   });
   rows.forEach((row, index) => {
-    const y = 58 + index * 48;
+    const y = rowStart + index * 48;
     const from = row.kind === 'request' ? row.span.from : row.span.to;
     const to = row.kind === 'request' ? row.span.to : row.span.from;
     const x1 = xOf(from);
     const x2 = xOf(to);
     const paused = (row.kind === 'request' && row.span.hold === 'request') || (row.kind === 'response' && row.span.hold === 'response');
+    const marks = spanMarks(row.span, budgetId);
     const selected = selectedSpanId === row.span.id && selectedSpanKind === row.kind;
     const hit = svgEl('rect', {
       class: selected ? 'hit selected' : 'hit',
       x: Math.min(x1, x2) - 12,
-      y: y - 18,
+      y: y - 28,
       width: Math.max(Math.abs(x2 - x1) + 24, 32),
-      height: 40,
+      height: 42,
       rx: 6,
       'data-span-id': row.span.id,
       'data-kind': row.kind,
@@ -822,22 +1212,28 @@ function renderDiagram() {
       selectedSpanId = row.span.id;
       selectedSpanKind = row.kind;
       updateDiagramSelection();
-      setTimeout(renderInspector, 0);
+      renderInspector();
+      renderLogs({ revealRelated: true });
     });
     const dir = x2 >= x1 ? 1 : -1;
+    const arrowClass = ['arrow', row.kind];
+    if (paused) arrowClass.push('paused');
+    if (marks.bad) arrowClass.push('bad');
+    if (marks.budget) arrowClass.push('budget');
     const arrow = svgEl('line', {
-      class: `arrow ${row.kind}${paused ? ' paused' : ''}`,
+      class: arrowClass.join(' '),
       x1,
       x2: x2 - dir * 8,
       y1: y,
       y2: y,
       'marker-end': 'url(#head)',
     });
-    const text = row.kind === 'request'
-      ? `${row.span.method} ${shortPath(row.span.path)}`
-      : `${row.span.status ?? '…'}${row.span.endedAt ? `  ${row.span.endedAt - row.span.startedAt}ms` : ''}`;
+    const text = diagramArrowText(row.span, row.kind, marks);
+    const labelClass = ['label'];
+    if (marks.bad) labelClass.push('bad');
+    if (marks.budget) labelClass.push('budget');
     const label = svgEl('text', {
-      class: 'label',
+      class: labelClass.join(' '),
       x: (x1 + x2) / 2,
       y: y - 8,
       'text-anchor': 'middle',
@@ -848,6 +1244,11 @@ function renderDiagram() {
   defs.innerHTML = '<marker id="head" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#efe7d2"/></marker>';
   svg.prepend(defs);
   root.append(svg);
+  if (diagramView.traceId !== trace.id) {
+    diagramView.traceId = trace.id;
+    diagramView.userMoved = false;
+  }
+  placeDiagram(svg);
 }
 
 function updateDiagramSelection() {
@@ -858,8 +1259,8 @@ function updateDiagramSelection() {
 
 function renderInspector() {
   const root = $('inspector');
-  const trace = filteredTraces().find((item) => item.id === selectedTraceId);
-  const span = trace?.spans.find((item) => item.id === selectedSpanId) || trace?.spans[0];
+  const trace = shownTrace();
+  const span = selectedSpan(trace);
   root.replaceChildren();
   if (!span) {
     const empty = document.createElement('div');
@@ -870,14 +1271,24 @@ function renderInspector() {
   }
   const title = document.createElement('h2');
   title.textContent = `${span.method} ${span.path}`;
-  const badge = document.createElement('div');
-  badge.className = span.status >= 400 || span.error ? 'badge bad' : 'badge ok';
+  const badge = document.createElement('span');
+  badge.className = spanIsBad(span) ? 'badge bad' : 'badge ok';
   badge.textContent = span.error ? span.error : (span.status ? String(span.status) : 'waiting');
+  const duration = spanDuration(span);
+  const budgetId = budgetSpanId(trace.spans);
+  const timing = document.createElement('span');
+  timing.className = 'hop-duration';
+  timing.textContent = duration == null
+    ? 'In flight'
+    : `${duration}ms${span.id === budgetId ? ' · slowest hop' : ''}`;
+  const statusRow = document.createElement('div');
+  statusRow.className = 'status-row';
+  statusRow.append(badge, timing);
   const request = requestDetails(span, trace);
   const titleRow = document.createElement('div');
   titleRow.className = 'inspector-title';
   const titleGroup = document.createElement('div');
-  titleGroup.append(title, badge);
+  titleGroup.append(title, statusRow);
   titleRow.append(titleGroup, copyButton('Copy all request details as JSON', () => JSON.stringify(request, null, 2), 'copy-all'));
   root.append(titleRow);
   root.append(detailSection('Route', `${span.from} → ${span.to}`, request.route));
@@ -885,27 +1296,135 @@ function renderInspector() {
   root.append(detailSection('Request body', pretty(span.requestBody), request.request.body));
   root.append(detailSection('Response headers', headerText(span.responseHeaders), request.response.headers));
   root.append(detailSection('Response body', pretty(span.responseBody), request.response.body));
+  root.append(hopLogs(trace, span));
 }
 
-function renderLogs() {
+function renderLogs({ stickToEnd = false, revealRelated = false } = {}) {
   const title = $('log-title');
   const selectedService = state.services.find((service) => service.name === logService);
   title.textContent = selectedService ? `${serviceDisplayName(selectedService)} logs` : 'All logs';
+  const note = $('log-note');
+  if (note) note.textContent = logNote;
   const entries = state.logEntries.filter((entry) => !logService || entry.service === logService);
   const view = $('log-view');
+  const previous = view.scrollTop;
+  const atEnd = view.scrollHeight - view.scrollTop - view.clientHeight < 24;
   view.replaceChildren();
+  const trace = shownTrace();
+  const span = selectedSpan(trace);
   for (const entry of entries) {
-    const line = document.createElement('span');
+    const located = locateLog(entry);
+    const related = trace && span && logMatchesSpan(entry, trace, span);
+    const line = document.createElement('button');
+    line.type = 'button';
     line.className = 'log-line';
+    if (related && highlightRelatedLogs) line.classList.add('log-related');
+    if (related) line.dataset.related = 'true';
+    if (located) line.classList.add('log-linked');
+    line.title = located ? 'Open the request for this log' : 'No request matched this log';
     const prefix = document.createElement('span');
     prefix.className = 'log-prefix';
     const service = state.services.find((item) => item.name === entry.service);
     prefix.textContent = `[${service ? serviceDisplayName(service) : entry.service}]`;
     if (service?.color) prefix.style.color = service.color;
     line.append(prefix, document.createTextNode(` ${entry.line}`));
+    line.addEventListener('click', () => openLog(entry));
     view.append(line);
   }
-  view.scrollTop = view.scrollHeight;
+  if (revealRelated) view.querySelector('[data-related="true"]')?.scrollIntoView({ block: 'nearest' });
+  else if (stickToEnd && atEnd) view.scrollTop = view.scrollHeight;
+  else view.scrollTop = previous;
+}
+
+function hopLogs(trace, span) {
+  const section = document.createElement('section');
+  section.className = 'detail-section';
+  section.append(heading('Hop logs'));
+  const matches = state.logEntries.filter((entry) => logMatchesSpan(entry, trace, span));
+  if (!matches.length) {
+    const empty = document.createElement('div');
+    empty.className = 'meta';
+    empty.textContent = 'Click a log line to open its request.';
+    section.append(empty);
+    return section;
+  }
+  const list = document.createElement('div');
+  list.className = 'hop-logs';
+  for (const entry of matches.slice(-HOP_LOG_LIMIT)) {
+    const line = document.createElement('button');
+    line.type = 'button';
+    line.textContent = `[${entry.service}] ${entry.line}`;
+    line.addEventListener('click', () => openLog(entry));
+    list.append(line);
+  }
+  section.append(list);
+  return section;
+}
+
+function spanInvolves(span, service) {
+  return service === span.from || service === span.to;
+}
+
+function logOverlaps(entry, span) {
+  if (!entry.at || !spanInvolves(span, entry.service)) return false;
+  const end = span.endedAt || Date.now();
+  return entry.at >= span.startedAt - LOG_MATCH_PAD_MS && entry.at <= end + LOG_MATCH_PAD_MS;
+}
+
+function logMatchesSpan(entry, trace, span) {
+  if (entry.traceId && entry.traceId !== trace.id) return false;
+  if (entry.traceId && entry.spanId) return entry.spanId === span.id;
+  if (entry.traceId) return spanInvolves(span, entry.service);
+  return logOverlaps(entry, span);
+}
+
+function openLog(entry) {
+  const located = locateLog(entry);
+  if (!located) {
+    logNote = entry.traceId
+      ? 'That request is no longer in the list.'
+      : 'No request matched this log line.';
+    renderLogs();
+    return;
+  }
+  logNote = '';
+  if (!traceMatchesFilters(located.trace)) {
+    traceListFilters.status = '';
+    traceListFilters.slow = false;
+    traceListFilters.pinned = false;
+    $('trace-status-filter').value = '';
+    $('trace-slow-filter').checked = false;
+    $('trace-pinned-filter').checked = false;
+    syncTraceFilters();
+  }
+  const span = located.span;
+  const kind = span && (span.endedAt || span.status || span.responseBody) ? 'response' : 'request';
+  selectTrace(located.trace.id, span?.id || null, span ? kind : null);
+}
+
+function locateLog(entry) {
+  if (entry.traceId) {
+    const trace = state.traces.find((item) => item.id === entry.traceId);
+    if (!trace) return null;
+    const span = (entry.spanId && trace.spans.find((item) => item.id === entry.spanId))
+      || trace.spans.find((item) => spanInvolves(item, entry.service))
+      || trace.spans[0]
+      || null;
+    return { trace, span };
+  }
+  let best = null;
+  let bestDistance = Infinity;
+  for (const trace of state.traces) {
+    for (const span of trace.spans) {
+      if (!logOverlaps(entry, span)) continue;
+      const end = span.endedAt || Date.now();
+      const distance = entry.at < span.startedAt ? span.startedAt - entry.at : Math.max(0, entry.at - end);
+      if (distance >= bestDistance) continue;
+      best = { trace, span };
+      bestDistance = distance;
+    }
+  }
+  return best;
 }
 function selectServiceLogs(name) {
   logService = logService === name ? null : name;
@@ -1037,6 +1556,14 @@ function svgEl(name, attrs, text) {
   for (const [key, value] of Object.entries(attrs || {})) node.setAttribute(key, value);
   if (text) node.textContent = text;
   return node;
+}
+
+function diagramText(className, x, y, lines, lineHeight) {
+  const text = svgEl('text', { class: className, x, y, 'text-anchor': 'middle' });
+  lines.forEach((line, index) => {
+    text.append(svgEl('tspan', { x, dy: index ? lineHeight : 0 }, line));
+  });
+  return text;
 }
 
 function visibleListeners() {
@@ -1205,6 +1732,7 @@ async function sendSample() {
   }
 }
 
+bindDiagramViewport();
 $('clear').addEventListener('click', () => post('/api/clear'));
 $('scan').addEventListener('click', () => { void scanPorts(); });
 $('settings-toggle').addEventListener('click', () => {
@@ -1213,7 +1741,8 @@ $('settings-toggle').addEventListener('click', () => {
   if (settingsOpen) $('settings-panel').querySelector('select, input')?.focus();
 });
 document.addEventListener('pointerdown', (event) => {
-  if (openServiceMenu && !event.target.closest('.service-menu, .service-menu-toggle')) {
+  const insideMenu = event.target.closest('.service-menu, .service-menu-toggle');
+  if (openServiceMenu && !insideMenu) {
     openServiceMenu = null;
     renderServices();
   }
@@ -1230,6 +1759,25 @@ $('trace-search').addEventListener('input', (event) => {
   traceFilter = event.target.value.trim();
   renderTraces();
 });
+$('trace-filters-toggle').addEventListener('click', () => {
+  traceFiltersOpen = !traceFiltersOpen;
+  syncTraceFilters();
+});
+$('trace-status-filter').addEventListener('change', (event) => {
+  traceListFilters.status = event.target.value;
+  syncTraceFilters();
+  renderTraces();
+});
+$('trace-slow-filter').addEventListener('change', (event) => {
+  traceListFilters.slow = event.target.checked;
+  syncTraceFilters();
+  renderTraces();
+});
+$('trace-pinned-filter').addEventListener('change', (event) => {
+  traceListFilters.pinned = event.target.checked;
+  syncTraceFilters();
+  renderTraces();
+});
 $('log-title').addEventListener('click', () => {
   logService = null;
   renderServices();
@@ -1241,6 +1789,13 @@ window.addEventListener('keydown', (event) => {
     settingsOpen = false;
     renderSettings();
     $('settings-toggle').focus();
+    return;
+  }
+  if (event.key === 'Escape' && traceFiltersOpen) {
+    event.preventDefault();
+    traceFiltersOpen = false;
+    syncTraceFilters();
+    $('trace-filters-toggle').focus();
     return;
   }
   if (event.key === 'Escape' && scanModal) {

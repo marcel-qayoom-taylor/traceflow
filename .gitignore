@@ -11,6 +11,7 @@ coverage/
 .nyc_output/
 .cache/
 traceflow.config.json
+traceflow.services.json
 .traceflow-token
 scan-modal-check.png
 .codex/

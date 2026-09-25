@@ -6,6 +6,15 @@ This project follows Semantic Versioning.
 
 ## Unreleased
 
+## 0.1.4 - 2026-09-25
+
+- Filter the trace list by status, slow hops, or pins.
+- Mark failing hops and the slowest hop on the sequence diagram.
+- Pin a trace so it stays in memory while older traces expire.
+- Link service logs to the request that wrote them.
+- Trace browser fetch and XHR calls from attached local web apps.
+- Remember attached services and restore them on the next start.
+
 ## 0.1.3 - 2026-09-24
 
 - Show repository names or local addresses consistently in service logs.

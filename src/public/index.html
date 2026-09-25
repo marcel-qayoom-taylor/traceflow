@@ -36,7 +36,26 @@
           <span>Traces</span>
           <button type="button" id="clear" class="text">Clear</button>
         </div>
-        <div class="trace-search"><input id="trace-search" type="search" placeholder="Filter traces (regex)" title="Search method, path, and services. Regular expressions are supported."></div>
+        <div class="trace-search">
+          <div class="trace-search-bar">
+            <input id="trace-search" type="search" placeholder="Filter traces (regex)" title="Search method, path, and services. Regular expressions are supported.">
+            <button type="button" id="trace-filters-toggle" aria-expanded="false" aria-controls="trace-filters" title="Trace filters">▸</button>
+          </div>
+          <div id="trace-filters" class="trace-filters" hidden>
+            <label>
+              <span>Status</span>
+              <select id="trace-status-filter">
+                <option value="">Any</option>
+                <option value="2xx">2xx</option>
+                <option value="3xx">3xx</option>
+                <option value="4xx">4xx</option>
+                <option value="5xx">5xx</option>
+              </select>
+            </label>
+            <label class="trace-filter-check" title="Hops of 500ms or more"><input id="trace-slow-filter" type="checkbox"> Slow hops</label>
+            <label class="trace-filter-check"><input id="trace-pinned-filter" type="checkbox"> Pinned</label>
+          </div>
+        </div>
         <div id="traces"></div>
       </section>
     </aside>
@@ -69,6 +88,7 @@
   <footer class="logs">
     <div class="log-header">
       <button type="button" id="log-title" class="text" title="Show all service logs">All logs</button>
+      <span id="log-note" class="log-note"></span>
       <button type="button" id="clear-logs" class="text" title="Clear captured logs">Clear logs</button>
     </div>
     <pre id="log-view"></pre>

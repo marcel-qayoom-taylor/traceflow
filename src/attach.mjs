@@ -152,15 +152,22 @@ export async function attachToListener({ port, service, ingest, token, peers, co
     process.env.TRACEFLOW_CONTROL = ${JSON.stringify(JSON.stringify(control))};
     if (load.cache) delete load.cache[load.resolve(${JSON.stringify(agentPath)})];
     load(${JSON.stringify(agentPath)});
-    return { pid: process.pid, installed: !!globalThis.__traceflowInstalled };
+    return {
+      pid: process.pid,
+      installed: !!globalThis.__traceflowInstalled,
+      attachState: globalThis.__traceflowAttachState || 'installed',
+    };
   })()`;
   const value = await evaluate(inspector.url, expression);
-  if (!value || value.pid !== listener.pid || !value.installed) {
-    return { ok: false, error: 'The inspector connected, but the agent did not install' };
-  }
   if (inspector.opened) {
     try { await evaluate(inspector.url, "(process.getBuiltinModule ? process.getBuiltinModule('inspector') : require('inspector')).close()"); } catch { /* closing the inspector drops the socket */ }
     openedByUs.delete(listener.pid);
+  }
+  if (!value || value.pid !== listener.pid || !value.installed) {
+    return { ok: false, error: 'The inspector connected, but the agent did not install' };
+  }
+  if (value.attachState === 'restart-required') {
+    return { ok: false, error: 'This service has an older Traceflow agent loaded. Restart it once, then attach again.' };
   }
   return { ok: true, pid: listener.pid };
 }
