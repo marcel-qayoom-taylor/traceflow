@@ -504,7 +504,7 @@ body.inspector-resizing { cursor: ew-resize; user-select: none; }
 .log-note { flex: 1; min-width: 0; color: var(--muted); font-size: 12px; letter-spacing: 0; text-transform: none; }
 .log-note:empty { display: none; }
 .log-header .text { font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; }
-.log-line { display: block; width: 100%; text-align: left; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; text-overflow: clip; border: 0; background: transparent; color: inherit; font: inherit; padding: 1px 4px; cursor: pointer; border-radius: 4px; }
+.log-line { display: block; width: 100%; text-align: left; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; text-overflow: clip; border: 0; background: transparent; color: inherit; font: inherit; padding: 1px 4px; cursor: text; border-radius: 4px; user-select: text; -webkit-user-select: text; }
 .log-line:hover { background: rgba(239, 231, 210, 0.06); }
 .log-line.log-linked { cursor: pointer; }
 .log-line.log-related { background: rgba(214, 255, 74, 0.06); }
@@ -515,18 +515,7 @@ body.inspector-resizing { cursor: ew-resize; user-select: none; }
   padding: 8px;
   font: 12px/1.45 ui-monospace, "SF Mono", Menlo, monospace;
 }
-.hop-logs button {
-  display: block;
-  width: 100%;
-  text-align: left;
-  border: 0;
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  padding: 2px 0;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
+.hop-logs .log-line { padding: 2px 0; }
 .banner { color: var(--request); font-size: 12px; letter-spacing: 0; text-transform: none; }
 
 @media (max-width: 980px) {

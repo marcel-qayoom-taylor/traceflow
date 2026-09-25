@@ -5,7 +5,8 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { loadConfig, startServer } from './server.mjs';
+import { workingDirectoryForCommand } from './attach.mjs';
+import { loadConfig, nodeBinForProject, startServer } from './server.mjs';
 
 const ignore = ['/health', '/healthcheck', '/ready', '/metrics', '/favicon.ico'];
 
@@ -20,7 +21,7 @@ test('attached services are restored from the local memory file', async () => {
   const remembered = path.join(directory, 'traceflow.services.json');
   fs.writeFileSync(remembered, JSON.stringify({
     services: [
-      { name: 'localhost-4101', port: 4101, command: 'node app.js', repo: 'app', discovered: true },
+      { name: 'localhost-4101', port: 4101, command: 'node app.js', cwd: '/tmp/app', repo: 'app', discovered: true },
       { name: 'api', port: 4102, command: 'node api.js', repo: 'api', discovered: true },
     ],
   }));
@@ -39,7 +40,96 @@ test('attached services are restored from the local memory file', async () => {
     assert.deepEqual(names, ['api', 'localhost-4101']);
     assert.equal(state.services.find((service) => service.name === 'api').command, 'node configured.js');
     assert.equal(state.services.find((service) => service.name === 'localhost-4101').discovered, true);
+    assert.equal(app.config.services.find((service) => service.name === 'localhost-4101').cwd, '/tmp/app');
   } finally {
+    await app.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('the agent does not keep a short-lived process alive', async () => {
+  const app = await startServer({ port: 0, config: { include: [], ignore, services: [] } });
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 300)'], {
+    env: {
+      ...process.env,
+      TRACEFLOW_SERVICE: 'exit-check',
+      TRACEFLOW_INGEST: app.url,
+      TRACEFLOW_TOKEN: app.token,
+      TRACEFLOW_CONTROL: '{}',
+      NODE_OPTIONS: `--require=${path.resolve('src/agent/preload.cjs')}`,
+    },
+    stdio: 'ignore',
+  });
+  try {
+    const code = await Promise.race([
+      new Promise((resolve) => child.once('exit', resolve)),
+      sleep(2000).then(() => 'timeout'),
+    ]);
+    assert.equal(code, 0);
+  } finally {
+    try { child.kill('SIGKILL'); } catch { /* already exited */ }
+    await app.close();
+  }
+});
+
+test('start prefers the Node version pinned by the project', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'traceflow-fnm-'));
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'traceflow-node-project-'));
+  const bin = path.join(home, '.local/share/fnm/node-versions/v24.16.0/installation/bin');
+  fs.mkdirSync(bin, { recursive: true });
+  fs.writeFileSync(path.join(bin, 'node'), '');
+  fs.writeFileSync(path.join(project, '.nvmrc'), '24.16.0\n');
+  try {
+    assert.equal(nodeBinForProject(project, { homedir: home, fnmDir: '' }), bin);
+    fs.writeFileSync(path.join(project, '.nvmrc'), '22\n');
+    const older = path.join(home, '.local/share/fnm/node-versions/v22.13.0/installation/bin');
+    const newer = path.join(home, '.local/share/fnm/node-versions/v22.22.2/installation/bin');
+    fs.mkdirSync(older, { recursive: true });
+    fs.mkdirSync(newer, { recursive: true });
+    fs.writeFileSync(path.join(older, 'node'), '');
+    fs.writeFileSync(path.join(newer, 'node'), '');
+    assert.equal(nodeBinForProject(project, { homedir: home, fnmDir: '' }), newer);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(project, { recursive: true, force: true });
+  }
+});
+
+test('a remembered command recovers the repository working directory', () => {
+  assert.equal(workingDirectoryForCommand(`node ${path.resolve('src/server.mjs')}`), path.resolve('.'));
+});
+
+test('stop then start relaunches from the remembered working directory', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'traceflow-restart-'));
+  const marker = path.join(directory, 'started.txt');
+  const port = 19997;
+  const occupant = spawnBare(port);
+  const app = await startServer({
+    port: 0,
+    config: {
+      baseDir: directory,
+      include: [],
+      ignore,
+      services: [{
+        name: 'svc-restart',
+        port,
+        cwd: directory,
+        command: `node -e "require('fs').writeFileSync('started.txt','ok'); require('http').createServer((q,s)=>s.end('ok')).listen(${port},'127.0.0.1')"`,
+      }],
+    },
+  });
+  try {
+    await waitFor(() => postJson(port, '/health', {}).then((result) => result.status === 200 ? result : null).catch(() => null));
+    const blocked = await app.startService('svc-restart');
+    assert.equal(blocked.ok, false);
+    const stopped = await app.stopService('svc-restart');
+    assert.equal(stopped.ok, true, stopped.error);
+    const started = await app.startService('svc-restart');
+    assert.equal(started.ok, true, started.error);
+    await waitFor(() => (fs.existsSync(marker) ? true : null));
+    assert.equal(fs.readFileSync(marker, 'utf8'), 'ok');
+  } finally {
+    try { occupant.kill('SIGKILL'); } catch { /* stopped by the API */ }
     await app.close();
     fs.rmSync(directory, { recursive: true, force: true });
   }

@@ -17,7 +17,10 @@ let logNote = '';
 let traceFilter = '';
 let traceFiltersOpen = false;
 const traceListFilters = { status: '', slow: false, pinned: false };
+const SCAN_POLL_MS = 2000;
 let scanning = false;
+let scanRefreshInFlight = false;
+let scanPollTimer = null;
 let scanNote = '';
 let scanQuery = '';
 let scanModal = null;
@@ -459,8 +462,9 @@ function applyDelta(data) {
     logs = true;
   }
   if (Array.isArray(data.discovered)) {
+    const previous = discoveredKey(state.discovered);
     state.discovered = data.discovered;
-    if (scanModal) renderScanResults();
+    if (scanModal && discoveredKey(state.discovered) !== previous) renderScanResults();
     chrome = true;
   }
   if (data.clear) {
@@ -734,6 +738,9 @@ function serviceIndicator(service, pendingAction) {
   }
   if (service.status === 'running' && service.attached) {
     return { tone: 'yellow', label: 'Attached, waiting for agent' };
+  }
+  if (service.status === 'running' && service.problem) {
+    return { tone: 'red', label: service.problem };
   }
   if (service.status === 'running') {
     return { tone: 'yellow', label: 'Running, not attached' };
@@ -1315,9 +1322,7 @@ function renderLogs({ stickToEnd = false, revealRelated = false } = {}) {
   for (const entry of entries) {
     const located = locateLog(entry);
     const related = trace && span && logMatchesSpan(entry, trace, span);
-    const line = document.createElement('button');
-    line.type = 'button';
-    line.className = 'log-line';
+    const line = logLine(() => openLog(entry));
     if (related && highlightRelatedLogs) line.classList.add('log-related');
     if (related) line.dataset.related = 'true';
     if (located) line.classList.add('log-linked');
@@ -1328,7 +1333,6 @@ function renderLogs({ stickToEnd = false, revealRelated = false } = {}) {
     prefix.textContent = `[${service ? serviceDisplayName(service) : entry.service}]`;
     if (service?.color) prefix.style.color = service.color;
     line.append(prefix, document.createTextNode(` ${entry.line}`));
-    line.addEventListener('click', () => openLog(entry));
     view.append(line);
   }
   if (revealRelated) view.querySelector('[data-related="true"]')?.scrollIntoView({ block: 'nearest' });
@@ -1351,10 +1355,8 @@ function hopLogs(trace, span) {
   const list = document.createElement('div');
   list.className = 'hop-logs';
   for (const entry of matches.slice(-HOP_LOG_LIMIT)) {
-    const line = document.createElement('button');
-    line.type = 'button';
+    const line = logLine(() => openLog(entry));
     line.textContent = `[${entry.service}] ${entry.line}`;
-    line.addEventListener('click', () => openLog(entry));
     list.append(line);
   }
   section.append(list);
@@ -1376,6 +1378,20 @@ function logMatchesSpan(entry, trace, span) {
   if (entry.traceId && entry.spanId) return entry.spanId === span.id;
   if (entry.traceId) return spanInvolves(span, entry.service);
   return logOverlaps(entry, span);
+}
+
+function logLine(onOpen) {
+  const line = document.createElement('div');
+  line.className = 'log-line';
+  let dragged = false;
+  line.addEventListener('pointerdown', () => { dragged = false; });
+  line.addEventListener('pointermove', (event) => { if (event.buttons) dragged = true; });
+  line.addEventListener('click', () => {
+    const selection = window.getSelection();
+    if (dragged || (selection && !selection.isCollapsed)) return;
+    onOpen();
+  });
+  return line;
 }
 
 function openLog(entry) {
@@ -1580,7 +1596,18 @@ function visibleListeners() {
     .sort((a, b) => a.port - b.port || a.pid - b.pid);
 }
 
+function stopScanPolling() {
+  clearInterval(scanPollTimer);
+  scanPollTimer = null;
+}
+
+function startScanPolling() {
+  stopScanPolling();
+  scanPollTimer = setInterval(() => { void refreshOpenScan(); }, SCAN_POLL_MS);
+}
+
 function closeScanModal() {
+  stopScanPolling();
   scanResults = null;
   scanModal?.remove();
   scanModal = null;
@@ -1684,6 +1711,60 @@ function openScanModal() {
   document.body.append(scanModal);
   input.focus();
   renderScanResults();
+  startScanPolling();
+}
+
+async function requestScan() {
+  const response = await fetch('/api/discovery/scan', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-traceflow-token': SESSION_TOKEN },
+    body: '{}',
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok || body.ok === false) return { ok: false, error: body.error || 'Could not scan ports' };
+  return { ok: true, listeners: Array.isArray(body.listeners) ? body.listeners : [] };
+}
+
+function applyScanResult(result) {
+  if (!result.ok) {
+    scanNote = result.error;
+    return;
+  }
+  state.discovered = result.listeners;
+  scanNote = result.listeners.length ? '' : 'No other Node.js listeners.';
+}
+
+async function refreshOpenScan() {
+  if (!scanModal || scanning || scanRefreshInFlight) return;
+  scanRefreshInFlight = true;
+  try {
+    const result = await requestScan();
+    if (!scanModal) return;
+    const previous = discoveredKey(state.discovered);
+    applyScanResult(result);
+    if (result.ok) {
+      if (discoveredKey(state.discovered) !== previous) renderScanResults();
+    } else if (!state.discovered.length) {
+      renderScanResults();
+    }
+  } catch {
+    if (!scanModal || state.discovered.length) return;
+    scanNote = 'Could not scan ports';
+    renderScanResults();
+  } finally {
+    scanRefreshInFlight = false;
+  }
+}
+
+function discoveredKey(listeners) {
+  return listeners.map((listener) => [
+    listener.port,
+    listener.pid,
+    listener.repo || '',
+    listener.repoPath || '',
+    listener.workingDirectory || '',
+    listener.attachable ? 1 : 0,
+  ].join('\0')).join('\n');
 }
 
 async function scanPorts() {
@@ -1695,17 +1776,7 @@ async function scanPorts() {
   if (existing) existing.value = '';
   openScanModal();
   try {
-    const response = await fetch('/api/discovery/scan', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-traceflow-token': SESSION_TOKEN },
-      body: '{}',
-    });
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok || body.ok === false) scanNote = body.error || 'Could not scan ports';
-    else if (Array.isArray(body.listeners)) {
-      state.discovered = body.listeners;
-      scanNote = body.listeners.length ? '' : 'No other Node.js listeners.';
-    }
+    applyScanResult(await requestScan());
   } catch {
     scanNote = 'Could not scan ports';
   } finally {

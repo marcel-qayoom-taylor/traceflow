@@ -134,6 +134,7 @@ function connectControl() {
       headers: { accept: 'text/event-stream', 'x-traceflow-token': TOKEN },
     },
     (res) => {
+      res.socket?.unref();
       if (res.statusCode !== 200) {
         res.resume();
         fail();
@@ -156,6 +157,7 @@ function connectControl() {
   );
   controlReq = req;
   req.on('error', fail);
+  unrefRequest(req);
   req.end();
 
   function fail() {
@@ -248,6 +250,11 @@ function takeBatch() {
   return batch;
 }
 
+function unrefRequest(req) {
+  req.unref?.();
+  req.on('socket', (socket) => socket.unref());
+}
+
 function postNow(event) {
   try {
     const data = Buffer.from(JSON.stringify(event));
@@ -267,6 +274,7 @@ function postNow(event) {
     );
     req.on('error', () => {});
     req.setTimeout(2000, () => req.destroy());
+    unrefRequest(req);
     req.end(data);
   } catch {
     // collector down

@@ -2,11 +2,12 @@
 
 import http from 'node:http';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { attachToListener, listenerOn, listeners, listenersByPort, repositoryName, stopListener } from './attach.mjs';
+import { attachToListener, killListener, launchTarget, listenerOn, listeners, listenersByPort, repositoryName, stopListener, workingDirectoryForCommand } from './attach.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const agentPath = path.join(root, 'src', 'agent', 'preload.cjs');
@@ -437,15 +438,16 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
     noteGates();
   }
 
-  function startService(name) {
+  async function startService(name) {
     const spec = activeConfig.services.find((service) => service.name === name);
     if (!spec) return { ok: false, error: 'unknown service' };
     const runtime = runtimes.get(name);
-    if (runtime?.owner === 'traceflow' && runtime.status === 'running') return { ok: true, status: 'running' };
+    if (runtime?.owner === 'traceflow' && runtime.status === 'running' && runtime.child) return { ok: true, status: 'running' };
+    if (!spec.cwd) spec.cwd = workingDirectoryForCommand(spec.command) || '';
     const listener = listenerOn(spec.port);
     if (listener) {
-      runtime.message = `Already running in your terminal (pid ${listener.pid}); connecting automatically.`;
-      runtime.problem = '';
+      runtime.message = `Already running in your terminal (pid ${listener.pid}). Stop it before starting a new one.`;
+      runtime.problem = runtime.message;
       noteServices();
       return { ok: false, error: runtime.message };
     }
@@ -461,9 +463,11 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
       TRACEFLOW_CONTROL: JSON.stringify(control),
       NODE_OPTIONS: joinNodeOptions(process.env.NODE_OPTIONS, agentPath),
     };
+    const nodeBin = nodeBinForProject(cwd);
+    if (nodeBin) env.PATH = `${nodeBin}${path.delimiter}${env.PATH || ''}`;
     const child = spec.args
       ? spawn(process.execPath, spec.args, { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
-      : spawn('bash', ['-lc', spec.command], { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+      : spawn('bash', ['-c', spec.command], { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
     runtime.child = child;
     runtime.pid = child.pid;
     runtime.status = 'running';
@@ -549,7 +553,13 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
       runtime.message = 'Stopping…';
       runtime.problem = '';
       noteServices();
-      if (!await waitForPortToStop(spec.port)) {
+      if (!await waitForPortToStop(spec.port, 2000)) {
+        const current = listenerOn(spec.port);
+        if (current) {
+          try { killListener(current.pid); } catch { /* already gone */ }
+        }
+      }
+      if (!await waitForPortToStop(spec.port, 2000)) {
         const current = listenerOn(spec.port);
         runtime.status = 'running';
         runtime.pid = current?.pid || listener.pid;
@@ -627,17 +637,29 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
     return (agents.get(name) || 0) > previousHello;
   }
 
+  function discoverySignature(items) {
+    return items.map((listener) => [
+      listener.port,
+      listener.pid,
+      listener.repo || '',
+      listener.repoPath || '',
+      listener.workingDirectory || '',
+    ].join('\0')).join('\n');
+  }
+
   function scanListeners() {
     const result = listeners();
     if (!result.ok) return { ok: false, error: 'Could not inspect local listening ports' };
     const configuredPorts = new Set(activeConfig.services.map((service) => Number(service.port)));
-    discovered = result.listeners
+    const next = result.listeners
       .filter((listener) => listener.node && listener.pid !== process.pid && !configuredPorts.has(listener.port))
       .map((listener) => ({
         ...listener,
         attachable: true,
       }));
-    noteServices();
+    const changed = discoverySignature(discovered) !== discoverySignature(next);
+    discovered = next;
+    if (changed) noteServices();
     return { ok: true, listeners: discovered };
   }
 
@@ -649,10 +671,12 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
     const listener = discovered.find((item) => item.port === value);
     if (!listener) return { ok: false, error: `Nothing is listening on ${value}` };
     if (!listener.node) return { ok: false, error: `pid ${listener.pid} on ${value} is not Node` };
+    const launch = launchTarget(listener.pid);
     const service = {
       name: `localhost-${value}`,
       port: value,
-      command: listener.command,
+      command: launch && !launch.sameProcess ? launch.command : listener.command,
+      cwd: launch?.cwd || listener.workingDirectory || workingDirectoryForCommand(listener.command) || '',
       repo: listener.repo,
       discovered: true,
     };
@@ -684,7 +708,8 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
           runtime.repo = listener.repo;
           changed = true;
         }
-        if (runtime.status !== 'running' || runtime.pid !== listener.pid || runtime.owner !== 'terminal') {
+        const pidChanged = runtime.pid !== listener.pid;
+        if (runtime.status !== 'running' || pidChanged || runtime.owner !== 'terminal') {
           runtime.status = 'running';
           runtime.pid = listener.pid;
           runtime.owner = 'terminal';
@@ -692,6 +717,10 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
           runtime.attachedPid = null;
           runtime.problem = '';
           changed = true;
+        }
+        if (service.discovered && (pidChanged || !service.cwd) && rememberLaunch(service, listener.pid)) {
+          changed = true;
+          saveRememberedServices(activeConfig);
         }
       } else if (runtime.owner === 'terminal') {
         runtime.status = 'stopped';
@@ -883,7 +912,7 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
       if (req.method === 'POST' && serviceMatch) {
         const name = decodeURIComponent(serviceMatch[1]);
         const action = serviceMatch[2];
-        const result = action === 'start' ? startService(name)
+        const result = action === 'start' ? await startService(name)
           : action === 'stop' ? await stopService(name)
             : await attachService(name);
         return json(res, result, result.ok === false ? 409 : 200);
@@ -1069,10 +1098,28 @@ export function restoreRememberedServices(config) {
       name,
       port,
       command: service.command ? String(service.command) : '',
+      cwd: service.cwd ? String(service.cwd) : '',
       repo: service.repo || null,
       discovered: true,
     });
   }
+}
+
+function rememberLaunch(service, pid) {
+  const launch = launchTarget(pid);
+  if (!launch) return false;
+  let changed = false;
+  const command = !launch.sameProcess && launch.command ? launch.command : service.command;
+  const cwd = launch.cwd || service.cwd || workingDirectoryForCommand(command) || '';
+  if (command && service.command !== command) {
+    service.command = command;
+    changed = true;
+  }
+  if (cwd && service.cwd !== cwd) {
+    service.cwd = cwd;
+    changed = true;
+  }
+  return changed;
 }
 
 export function saveRememberedServices(config) {
@@ -1082,6 +1129,7 @@ export function saveRememberedServices(config) {
     name: service.name,
     port: service.port,
     command: service.command || '',
+    cwd: service.cwd || '',
     repo: service.repo || null,
     discovered: true,
   }));
@@ -1098,6 +1146,67 @@ export function loadConfig({ cwd = process.cwd(), env = process.env } = {}) {
   const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
   if (parsed.services !== undefined && !Array.isArray(parsed.services)) throw new Error('traceflow.config.json services must be an array');
   return { ...parsed, services: parsed.services || [], baseDir: path.dirname(file) };
+}
+
+export function nodeBinForProject(cwd, { homedir = os.homedir(), fnmDir = process.env.FNM_DIR } = {}) {
+  const requested = readProjectNodeVersion(cwd);
+  if (!requested) return null;
+  const bins = [];
+  const roots = [
+    fnmDir && path.join(fnmDir, 'node-versions'),
+    path.join(homedir, '.local/share/fnm/node-versions'),
+    path.join(homedir, 'Library/Application Support/fnm/node-versions'),
+    path.join(homedir, '.fnm/node-versions'),
+    path.join(homedir, '.nvm/versions/node'),
+  ].filter(Boolean);
+  for (const rootDir of roots) {
+    let entries = [];
+    try { entries = fs.readdirSync(rootDir); } catch { continue; }
+    for (const entry of entries) {
+      const version = entry.replace(/^v/, '');
+      if (!versionMatches(version, requested)) continue;
+      for (const bin of [path.join(rootDir, entry, 'installation/bin'), path.join(rootDir, entry, 'bin')]) {
+        if (fs.existsSync(path.join(bin, 'node'))) bins.push({ version, bin });
+      }
+    }
+  }
+  bins.sort((a, b) => compareVersions(b.version, a.version));
+  return bins[0]?.bin || null;
+}
+
+function readProjectNodeVersion(directory) {
+  for (const file of ['.nvmrc', '.node-version']) {
+    try {
+      const line = fs.readFileSync(path.join(directory, file), 'utf8').split('\n').map((item) => item.trim()).find(Boolean);
+      if (line) return line.replace(/^v/, '');
+    } catch { /* not present */ }
+  }
+  try {
+    const line = fs.readFileSync(path.join(directory, '.tool-versions'), 'utf8').split('\n').find((item) => /^(node|nodejs)\s+/.test(item));
+    if (line) return line.split(/\s+/)[1].replace(/^v/, '');
+  } catch { /* not present */ }
+  return null;
+}
+
+function versionMatches(installed, requested) {
+  const want = versionParts(requested);
+  const have = versionParts(installed);
+  return want.length > 0 && want.every((part, index) => have[index] === part);
+}
+
+function versionParts(version) {
+  return String(version).replace(/^v/, '').split('.').map((part) => Number.parseInt(part, 10)).filter((part) => Number.isInteger(part));
+}
+
+function compareVersions(left, right) {
+  const a = versionParts(left);
+  const b = versionParts(right);
+  const length = Math.max(a.length, b.length);
+  for (let index = 0; index < length; index += 1) {
+    const diff = (a[index] || 0) - (b[index] || 0);
+    if (diff) return diff;
+  }
+  return 0;
 }
 
 function joinNodeOptions(existing, preload) {

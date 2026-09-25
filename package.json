@@ -1,6 +1,6 @@
 {
   "name": "traceflow-debugger",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "type": "module",
   "description": "Local sequence debugger for Node.js services",
   "license": "MIT",

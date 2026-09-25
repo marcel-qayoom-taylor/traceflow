@@ -6,6 +6,12 @@ This project follows Semantic Versioning.
 
 ## Unreleased
 
+## 0.1.5 - 2026-09-25
+
+- Restart an attached service from its dev command, working directory, and pinned Node version.
+- Keep short-lived commands such as `yarn clean` from hanging on the Traceflow agent.
+- Let log lines be selected and copied, and still open the related request on click.
+
 ## 0.1.4 - 2026-09-25
 
 - Filter the trace list by status, slow hops, or pins.

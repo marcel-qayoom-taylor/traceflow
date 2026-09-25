@@ -129,9 +129,34 @@ export function listenerOn(port) {
 }
 
 export function stopListener(pid) {
+  return signalDevTree(pid, 'SIGTERM');
+}
+
+export function killListener(pid) {
+  return signalDevTree(pid, 'SIGKILL');
+}
+
+export function launchTarget(pid) {
   const root = devRoot(pid);
-  process.kill(root, 'SIGTERM');
-  return root;
+  const info = readProc(root);
+  if (!info) return null;
+  return {
+    pid: root,
+    command: info.command,
+    cwd: processCwds([root]).get(root) || null,
+    sameProcess: root === pid,
+  };
+}
+
+export function workingDirectoryForCommand(command) {
+  const paths = String(command || '').match(/\/[^\s'"]+/g) || [];
+  for (const file of paths) {
+    if (!fs.existsSync(file)) continue;
+    const start = fs.statSync(file).isDirectory() ? file : path.dirname(file);
+    const repo = repositoryDirectory(start);
+    if (repo) return repo;
+  }
+  return null;
 }
 
 export async function attachToListener({ port, service, ingest, token, peers, control, agentPath }) {
@@ -175,13 +200,17 @@ export async function attachToListener({ port, service, ingest, token, peers, co
 async function ensureInspector(pid) {
   const existing = await inspectorFor(pid);
   if (existing) return { url: existing, opened: false };
-  process.kill(pid, 'SIGUSR1');
-  for (let attempt = 0; attempt < 25; attempt += 1) {
-    await sleep(100);
-    const url = await inspectorFor(pid);
-    if (url) {
-      openedByUs.add(pid);
-      return { url, opened: true };
+  // SIGUSR1 toggles the inspector. If one is already open and the scan missed it,
+  // the first signal closes it and the second opens it again.
+  for (let signal = 0; signal < 2; signal += 1) {
+    process.kill(pid, 'SIGUSR1');
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      await sleep(100);
+      const url = await inspectorFor(pid);
+      if (url) {
+        openedByUs.add(pid);
+        return { url, opened: true };
+      }
     }
   }
   throw new Error('Could not open the Node inspector on that process');
@@ -292,6 +321,39 @@ function evaluate(wsUrl, expression) {
       });
     }
   });
+}
+
+function signalDevTree(pid, signal) {
+  const root = devRoot(pid);
+  const group = groupId(root);
+  const leader = group ? readProc(group) : null;
+  const killGroup = group
+    && group !== process.pid
+    && group !== process.ppid
+    && leader
+    && leader.pid !== process.pid
+    && !isShell(leader.command);
+  try {
+    if (killGroup) process.kill(-group, signal);
+    else process.kill(root, signal);
+  } catch {
+    try { process.kill(root, signal); } catch { /* already gone */ }
+  }
+  return root;
+}
+
+function groupId(pid) {
+  try {
+    const output = execFileSync('ps', ['-o', 'pgid=', '-p', String(pid)], {
+      encoding: 'utf8',
+      timeout: 1500,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    const group = Number(output);
+    return Number.isInteger(group) && group > 1 ? group : null;
+  } catch {
+    return null;
+  }
 }
 
 function devRoot(pid) {
