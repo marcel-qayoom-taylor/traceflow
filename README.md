@@ -15,6 +15,11 @@ Traceflow is designed for local development. It does not require a hosted collec
 <img width="2560" height="1291" alt="Screenshot 2026-09-24 at 12 55 50 pm" src="https://github.com/user-attachments/assets/bf842b18-9234-48fb-b9c9-3ecf13e7b36b" />
 
 
+## Video
+
+https://github.com/user-attachments/assets/6dda7147-abe5-43ee-9198-c3c1d159cf15
+
+
 ## Requirements
 
 - Node.js 22 or newer
