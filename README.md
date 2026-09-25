@@ -17,7 +17,8 @@ Traceflow is designed for local development. It does not require a hosted collec
 
 ## Video
 
-https://github.com/user-attachments/assets/6dda7147-abe5-43ee-9198-c3c1d159cf15
+https://github.com/user-attachments/assets/6df8d237-a995-44cd-a413-fbab897a1d31
+
 
 
 ## Requirements
