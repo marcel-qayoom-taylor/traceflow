@@ -786,9 +786,8 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
       if (requiresSessionToken(req, url) && requestToken(req, url) !== sessionToken) {
         return json(res, { error: 'invalid session token' }, 403);
       }
-      if (req.method === 'GET' && url.pathname === '/favicon.ico') {
-        res.writeHead(204);
-        return res.end();
+      if (req.method === 'GET' && (url.pathname === '/favicon.ico' || url.pathname === '/favicon.svg')) {
+        return file(res, path.join(publicDir, 'favicon.svg'), 'image/svg+xml');
       }
       if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
         return file(res, path.join(publicDir, 'index.html'), 'text/html; charset=utf-8', {
