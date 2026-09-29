@@ -518,6 +518,125 @@ test('an attached agent reconnects after the Traceflow collector restarts', asyn
   }
 });
 
+test('an attached service is reattached when the same project restarts', async () => {
+  const port = 9331;
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'traceflow-sticky-'));
+  const app = await startServer({
+    port: 0,
+    config: {
+      baseDir: directory,
+      include: [],
+      ignore,
+      services: [{ name: 'sticky-service', cwd: directory, port, command: 'echo sticky' }],
+    },
+  });
+  const children = [];
+  const start = () => {
+    const child = spawnBare(port, { cwd: directory });
+    children.push(child);
+    return child;
+  };
+  try {
+    start();
+    await waitFor(() => postJson(port, '/health', {}).then(() => true).catch(() => false));
+    await waitFor(async () => (await api(app, '/api/state')).services[0]?.status === 'running');
+    const attached = await api(app, '/api/services/sticky-service/attach', { method: 'POST', body: {} });
+    assert.equal(attached.ok, true, attached.error);
+    const first = await waitFor(async () => {
+      const service = (await api(app, '/api/state')).services[0];
+      return service?.agent ? service : null;
+    }, 15000);
+    const saved = JSON.parse(fs.readFileSync(path.join(directory, 'traceflow.services.json'), 'utf8'));
+    assert.equal(saved.autoReattach, true);
+    assert.equal(saved.sticky.some((item) => item.name === 'sticky-service'), true);
+
+    process.kill(children.at(-1).pid, 'SIGKILL');
+    await waitDown(port);
+    start();
+    await waitFor(() => postJson(port, '/health', {}).then(() => true).catch(() => false));
+    const restarted = await waitFor(async () => {
+      await postJson(port, '/restarted', {}).catch(() => {});
+      const snapshot = await api(app, '/api/state');
+      const service = snapshot.services[0];
+      const log = snapshot.logEntries.some((entry) => entry.service === 'sticky-service' && entry.line.includes('handled /restarted'));
+      return service?.pid && service.pid !== first.pid && service.agent && log ? service : null;
+    }, 15000);
+    const disabled = await api(app, '/api/control', { method: 'POST', body: { autoReattach: false } });
+    assert.equal(disabled.autoReattach, false);
+    const releasedPid = restarted.pid;
+    process.kill(children.at(-1).pid, 'SIGKILL');
+    await waitDown(port);
+    start();
+    await waitFor(() => postJson(port, '/left-alone', {}).then(() => true).catch(() => false));
+    const leftAlone = await waitFor(async () => {
+      const service = (await api(app, '/api/state')).services[0];
+      return service?.pid && service.pid !== releasedPid && service.status === 'running' && !service.agent ? service : null;
+    }, 15000);
+    assert.equal(leftAlone.attached, false);
+    await sleep(300);
+    const quiet = await api(app, '/api/state');
+    assert.equal(quiet.logEntries.some((entry) => entry.line.includes('handled /left-alone')), false);
+  } finally {
+    for (const child of children) {
+      try { process.kill(child.pid, 'SIGKILL'); } catch { /* already stopped */ }
+    }
+    await app.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a different project on the same port is not reattached', async () => {
+  const port = 9332;
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'traceflow-home-'));
+  const other = fs.mkdtempSync(path.join(os.tmpdir(), 'traceflow-other-'));
+  const app = await startServer({
+    port: 0,
+    config: {
+      baseDir: home,
+      include: [],
+      ignore,
+      services: [{ name: 'sticky-home', cwd: home, port, command: 'echo home' }],
+    },
+  });
+  const children = [];
+  const start = (cwd) => {
+    const child = spawnBare(port, { cwd });
+    children.push(child);
+    return child;
+  };
+  try {
+    start(home);
+    await waitFor(() => postJson(port, '/health', {}).then(() => true).catch(() => false));
+    await waitFor(async () => (await api(app, '/api/state')).services[0]?.status === 'running');
+    const attached = await api(app, '/api/services/sticky-home/attach', { method: 'POST', body: {} });
+    assert.equal(attached.ok, true, attached.error);
+    const first = await waitFor(async () => {
+      const service = (await api(app, '/api/state')).services[0];
+      return service?.agent ? service : null;
+    }, 15000);
+
+    process.kill(children.at(-1).pid, 'SIGKILL');
+    await waitDown(port);
+    start(other);
+    await waitFor(() => postJson(port, '/other', {}).then(() => true).catch(() => false));
+    const blocked = await waitFor(async () => {
+      const service = (await api(app, '/api/state')).services[0];
+      return service?.pid && service.pid !== first.pid && service.status === 'running' && !service.agent && /different project/.test(service.message) ? service : null;
+    }, 15000);
+    assert.equal(blocked.attached, false);
+    await sleep(300);
+    const quiet = await api(app, '/api/state');
+    assert.equal(quiet.logEntries.some((entry) => entry.line.includes('handled /other')), false);
+  } finally {
+    for (const child of children) {
+      try { process.kill(child.pid, 'SIGKILL'); } catch { /* already stopped */ }
+    }
+    await app.close();
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(other, { recursive: true, force: true });
+  }
+});
+
 test('stop does not complete until the listener has left the port', async () => {
   const child = spawnBare(9315);
   await waitFor(() => postJson(9315, '/health', {}).then((result) => result.status === 200 ? result : null).catch(() => null));
@@ -946,7 +1065,7 @@ function spawnBare(port, options = {}) {
   const args = options.esm
     ? ['--inspect-port=0', '--input-type=module', '-e', source]
     : ['--inspect-port=0', '-e', source];
-  const child = spawn(process.execPath, args, { env, detached: true, stdio: 'ignore' });
+  const child = spawn(process.execPath, args, { env, cwd: options.cwd, detached: true, stdio: 'ignore' });
   child.unref();
   return child;
 }
@@ -1017,6 +1136,17 @@ function postJson(port, pathname, payload, extraHeaders = {}) {
     });
     req.end(body);
   });
+}
+
+async function waitDown(port) {
+  await waitFor(async () => {
+    try {
+      await postJson(port, '/health', {});
+      return false;
+    } catch {
+      return true;
+    }
+  }, 8000);
 }
 
 async function waitHealth(ports) {

@@ -1,6 +1,6 @@
 const state = {
   demo: false,
-  control: { mode: 'run', pauseOnResponse: true, captureBrowser: true, captureDebug: false, capture: 'all', include: [], ignore: [] },
+  control: { mode: 'run', pauseOnResponse: true, captureBrowser: true, captureDebug: false, capture: 'all', autoReattach: true, include: [], ignore: [] },
   gates: [],
   services: [],
   discovered: [],
@@ -700,18 +700,25 @@ function renderSettings() {
     renderLogs();
   });
 
-  panel.append(captureHeading, captureRow, browserRow, browserNote, debugRow, debugNote, playbackHeading, responseRow, followRow, displayHeading, highlightRow);
+  const servicesHeading = document.createElement('div');
+  servicesHeading.className = 'settings-heading';
+  servicesHeading.textContent = 'Services';
+  const reattachRow = settingsCheckbox('Auto-reattach', state.control.autoReattach !== false, (checked) => {
+    state.control.autoReattach = checked;
+    void post('/api/control', { autoReattach: checked });
+  });
+  const reattachNote = document.createElement('div');
+  reattachNote.className = 'settings-note';
+  reattachNote.textContent = 'Brings back services you have already attached when they restart.';
+  panel.append(captureHeading, captureRow, browserRow, browserNote, debugRow, debugNote, playbackHeading, responseRow, followRow, displayHeading, highlightRow, servicesHeading, reattachRow, reattachNote);
   if (hiddenServices.size) {
-    const servicesHeading = document.createElement('div');
-    servicesHeading.className = 'settings-heading';
-    servicesHeading.textContent = 'Services';
     const restore = button(`Restore removed services (${hiddenServices.size})`, () => {
       hiddenServices.clear();
       storeServicePreferences();
       renderServices();
       renderSettings();
     }, { className: 'settings-action' });
-    panel.append(servicesHeading, restore);
+    panel.append(restore);
   }
 }
 
@@ -807,7 +814,7 @@ function renderServices() {
         renderLogs();
       });
       rename.setAttribute('role', 'menuitem');
-      menu.append(remove, rename);
+      menu.append(rename, remove);
       card.append(menu);
     }
     const row = document.createElement('div');

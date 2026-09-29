@@ -6,6 +6,10 @@ This project follows Semantic Versioning.
 
 ## Unreleased
 
+## 0.1.6 - 2026-09-29
+
+- Reattach a service after it restarts when it is the same project you already attached. Auto-reattach is on by default and can be turned off in Settings.
+
 ## 0.1.5 - 2026-09-25
 
 - Restart an attached service from its dev command, working directory, and pinned Node version.

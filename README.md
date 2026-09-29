@@ -74,6 +74,7 @@ Everything stays on your machine and captured data is held in memory only.
 - Request and response headers and bodies with sensitive values redacted
 - Pause, step, and resume controls for local requests
 - Explicit attachment to already-running Node.js processes
+- Reattach those services after they restart. Turn off Auto-reattach in Settings to stop that.
 - Optional service startup from a local config file
 - Listener discovery with repository badges
 - Collapsed bursts for repeated requests without discarding raw traces

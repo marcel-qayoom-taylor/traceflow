@@ -48,6 +48,7 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
     captureBrowser: true,
     captureDebug: false,
     capture: 'all',
+    autoReattach: activeConfig.autoReattach !== false,
     include: activeConfig.include || [],
     ignore: activeConfig.ignore || DEFAULT_IGNORE,
   };
@@ -68,6 +69,9 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
   let expireTimer = null;
   let controlPing = null;
   const pendingLogs = [];
+  const reattaching = new Set();
+  const DIFFERENT_PROJECT = 'A different project is listening on this port, so it was left unattached.';
+  const NOT_NODE = 'The process on this port is not Node, so it was left unattached.';
   const maxTraces = limits?.maxTraces ?? 200;
   const maxSpans = limits?.maxSpans ?? 200;
   const incompleteTtlMs = limits?.incompleteTtlMs ?? 5 * 60 * 1000;
@@ -595,10 +599,11 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
     return !listenerOn(port);
   }
 
-  async function attachService(name) {
+  async function attachService(name, { remember = false } = {}) {
     const spec = activeConfig.services.find((service) => service.name === name);
     const runtime = runtimes.get(name);
     if (!spec || !runtime) return { ok: false, error: 'unknown service' };
+    if (remember) spec.sticky = true;
     try {
       const previousHello = agents.get(spec.name) || 0;
       const result = await attachToListener({
@@ -616,8 +621,16 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
       }
       runtime.message = result.ok ? '' : result.error;
       runtime.problem = result.ok || runtime.status === 'running' ? '' : result.error;
-      if (result.ok) runtime.attachedPid = result.pid;
-      if (result.ok) pushLog(name, `[traceflow] attached to pid ${result.pid}`);
+      if (result.ok) {
+        runtime.attachedPid = result.pid;
+        pushLog(name, `[traceflow] attached to pid ${result.pid}`);
+        if (spec.sticky) {
+          const launch = launchTarget(result.pid);
+          if (launch?.cwd) spec.stickyCwd = canonicalDirectory(launch.cwd);
+          if (spec.discovered) rememberLaunch(spec, result.pid);
+          saveRememberedServices(activeConfig);
+        }
+      }
       noteServices();
       return result;
     } catch (err) {
@@ -635,6 +648,31 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
       await sleep(50);
     }
     return (agents.get(name) || 0) > previousHello;
+  }
+
+  function clearStickyMessage(runtime) {
+    if (runtime.message !== DIFFERENT_PROJECT && runtime.message !== NOT_NODE) return false;
+    runtime.message = '';
+    return true;
+  }
+
+  function scheduleReattach(name) {
+    if (closed || reattaching.has(name)) return;
+    reattaching.add(name);
+    void attachService(name).finally(() => reattaching.delete(name));
+  }
+
+  function stickyDirectory(service) {
+    const raw = service.stickyCwd || service.cwd;
+    if (!raw) return null;
+    return canonicalDirectory(path.resolve(activeConfig.baseDir || root, raw));
+  }
+
+  function sameProcessIdentity(service, listener) {
+    const expected = stickyDirectory(service);
+    const actual = listener?.workingDirectory ? canonicalDirectory(listener.workingDirectory) : '';
+    if (!expected || !actual) return false;
+    return actual === expected || actual.startsWith(`${expected}${path.sep}`) || expected.startsWith(`${actual}${path.sep}`);
   }
 
   function discoverySignature(items) {
@@ -687,7 +725,7 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
     discovered = discovered.filter((item) => item.port !== value);
     saveRememberedServices(activeConfig);
     noteServices();
-    return attachService(service.name);
+    return attachService(service.name, { remember: true });
   }
 
   async function refreshListeners() {
@@ -718,9 +756,20 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
           runtime.problem = '';
           changed = true;
         }
-        if (service.discovered && (pidChanged || !service.cwd) && rememberLaunch(service, listener.pid)) {
+        const sameIdentity = sameProcessIdentity(service, listener);
+        const foreign = service.sticky && Boolean(stickyDirectory(service) && listener.workingDirectory) && !sameIdentity;
+        if (service.discovered && !foreign && (pidChanged || !service.cwd) && rememberLaunch(service, listener.pid)) {
           changed = true;
           saveRememberedServices(activeConfig);
+        }
+        if (!control.autoReattach || !service.sticky) {
+          if (clearStickyMessage(runtime)) changed = true;
+        } else if (runtime.attachedPid !== listener.pid) {
+          const blocked = !listener.node ? NOT_NODE : foreign ? DIFFERENT_PROJECT : '';
+          if (blocked && runtime.message !== blocked) {
+            runtime.message = blocked;
+            changed = true;
+          } else if (sameIdentity) scheduleReattach(service.name);
         }
       } else if (runtime.owner === 'terminal') {
         runtime.status = 'stopped';
@@ -728,6 +777,7 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
         runtime.owner = null;
         runtime.attachedPid = null;
         runtime.problem = '';
+        clearStickyMessage(runtime);
         changed = true;
       }
     }
@@ -840,6 +890,12 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
         if (typeof body.pauseOnResponse === 'boolean') control.pauseOnResponse = body.pauseOnResponse;
         if (typeof body.captureBrowser === 'boolean') control.captureBrowser = body.captureBrowser;
         if (typeof body.captureDebug === 'boolean') control.captureDebug = body.captureDebug;
+        if (typeof body.autoReattach === 'boolean') {
+          control.autoReattach = body.autoReattach;
+          activeConfig.autoReattach = body.autoReattach;
+          saveRememberedServices(activeConfig);
+          if (body.autoReattach) void refreshListeners();
+        }
         if (['all', 'matched', 'armed', 'off'].includes(body.capture)) control.capture = body.capture;
         if (Array.isArray(body.include)) control.include = body.include.map(String).filter(Boolean);
         if (Array.isArray(body.ignore)) control.ignore = body.ignore.map(String).filter(Boolean);
@@ -913,7 +969,7 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
         const action = serviceMatch[2];
         const result = action === 'start' ? await startService(name)
           : action === 'stop' ? await stopService(name)
-            : await attachService(name);
+            : await attachService(name, { remember: true });
         return json(res, result, result.ok === false ? 409 : 200);
       }
       json(res, { error: 'not found' }, 404);
@@ -1070,6 +1126,11 @@ function redactText(value) {
     .replace(/(bearer\s+)[a-z0-9._~+/-]+=*/gi, '$1[redacted]');
 }
 
+function canonicalDirectory(directory) {
+  const resolved = path.resolve(directory);
+  try { return fs.realpathSync(resolved); } catch { return resolved; }
+}
+
 function rememberedServicesFile(config) {
   if (!config?.baseDir) return null;
   return path.join(config.baseDir, 'traceflow.services.json');
@@ -1084,6 +1145,7 @@ export function restoreRememberedServices(config) {
   } catch {
     return;
   }
+  config.autoReattach = parsed.autoReattach !== false;
   if (!Array.isArray(config.services)) config.services = [];
   const ports = new Set(config.services.map((service) => Number(service.port)));
   const names = new Set(config.services.map((service) => service.name));
@@ -1100,7 +1162,16 @@ export function restoreRememberedServices(config) {
       cwd: service.cwd ? String(service.cwd) : '',
       repo: service.repo || null,
       discovered: true,
+      sticky: service.sticky !== false,
+      stickyCwd: service.stickyCwd ? String(service.stickyCwd) : '',
     });
+  }
+  const stickyByName = new Map((parsed.sticky || []).filter((item) => item?.name).map((item) => [String(item.name), item]));
+  for (const service of config.services) {
+    const saved = stickyByName.get(service.name);
+    if (!saved || service.discovered) continue;
+    service.sticky = true;
+    if (saved.stickyCwd) service.stickyCwd = String(saved.stickyCwd);
   }
 }
 
@@ -1131,8 +1202,14 @@ export function saveRememberedServices(config) {
     cwd: service.cwd || '',
     repo: service.repo || null,
     discovered: true,
+    sticky: Boolean(service.sticky),
+    stickyCwd: service.stickyCwd || '',
   }));
-  fs.writeFileSync(file, `${JSON.stringify({ services }, null, 2)}\n`);
+  const sticky = (config.services || []).filter((service) => service.sticky && !service.discovered).map((service) => ({
+    name: service.name,
+    stickyCwd: service.stickyCwd || '',
+  }));
+  fs.writeFileSync(file, `${JSON.stringify({ autoReattach: config.autoReattach !== false, services, sticky }, null, 2)}\n`);
 }
 
 export function loadConfig({ cwd = process.cwd(), env = process.env } = {}) {
