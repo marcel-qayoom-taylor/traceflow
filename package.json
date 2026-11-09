@@ -24,6 +24,7 @@
     "src/mcp",
     "src/public",
     "src/server.mjs",
+    "src/preflight.mjs",
     "README.md",
     "LICENSE",
     "SECURITY.md",

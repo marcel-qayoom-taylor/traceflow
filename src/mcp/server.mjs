@@ -6,6 +6,18 @@ const traceflowUrl = process.env.TRACEFLOW_URL || 'http://127.0.0.1:9477';
 
 const tools = [
   {
+    name: 'traceflow_preflight',
+    description: 'Check local service prerequisites and configured readiness endpoints. Results include healthy, degraded or unhealthy status. Specify a stack to also require each member to be running. Returns missing environment key names, never values. Does not change files or start services.',
+    inputSchema: { type: 'object', properties: { service: { type: 'string' }, stack: { type: 'string' } }, additionalProperties: false },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: 'traceflow_stacks',
+    description: 'List configured local stacks and the services each stack owns for cleanup.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    annotations: { readOnlyHint: true },
+  },
+  {
     name: 'traceflow_overview',
     description: 'Read a compact, token-efficient local Traceflow health overview. Use this first when diagnosing a locally running service; request logs or a trace only when the overview identifies something to investigate.',
     inputSchema: {
@@ -95,6 +107,15 @@ async function handle(message) {
 async function callTool(id, params) {
   if (!tools.some((tool) => tool.name === params.name)) return errorResponse(id, -32602, `Unknown tool: ${params.name}`);
   try {
+    if (params.name === 'traceflow_preflight' || params.name === 'traceflow_stacks') {
+      const endpoint = params.name === 'traceflow_stacks' ? '/api/stacks' : '/api/preflight';
+      const query = new URLSearchParams();
+      if (params.arguments?.service) query.set('service', params.arguments.service);
+      if (params.arguments?.stack) query.set('stack', params.arguments.stack);
+      const response = await fetch(`${traceflowUrl}${endpoint}${query.size ? `?${query}` : ''}`, { signal: AbortSignal.timeout(10_000) });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return result(id, { content: [{ type: 'text', text: JSON.stringify(await response.json()) }] });
+    }
     const state = await fetchState();
     const args = params.arguments || {};
     let content;
@@ -133,7 +154,7 @@ function overview(state, { service, traceLimit = 8 }) {
     .map((span) => ({ traceId: trace.id, ...span })))
     .slice(0, 8);
   return {
-    services: (state.services || []).map(({ name, status, agent }) => ({ name, status, agent })),
+    services: (state.services || []).map(serviceSummary),
     alerts,
     slowSpans,
     recentTraces: traces,
@@ -224,6 +245,19 @@ function redactHeaders(headers) {
   ]));
 }
 
+// Process services have no port; their match tokens say which command they follow.
+function serviceSummary({ name, kind, status, agent, match, owner, pid }) {
+  return {
+    name,
+    owner,
+    pid,
+    kind: kind || 'port',
+    status,
+    agent,
+    ...(kind === 'process' && Array.isArray(match) ? { command: match.join(' ') } : {}),
+  };
+}
+
 function clip(value, maxChars) {
   const text = String(value || '');
   return text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;
@@ -237,7 +271,7 @@ async function fetchState() {
 
 function summarize(state, service) {
   const matchesService = (span) => !service || span.from === service || span.to === service;
-  const services = (state.services || []).map(({ name, port, status, agent }) => ({ name, port, status, agent }));
+  const services = (state.services || []).map((item) => ({ ...serviceSummary(item), ...(item.port ? { port: item.port } : {}) }));
   const logs = (state.logEntries || [])
     .filter((entry) => !service || entry.service === service)
     .slice(-100);

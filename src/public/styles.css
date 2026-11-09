@@ -286,6 +286,8 @@ main { display: grid; grid-template-columns: 280px minmax(360px, 1fr) 10px minma
   margin-top: 8px;
 }
 .service-footer .meta { min-width: 0; }
+.service-note { margin-top: 6px; color: #f3c969; font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; }
+.service-note.problem { color: var(--pause); }
 .service .actions { display: flex; min-width: 0; justify-self: end; gap: 6px; }
 .service button, .discovered-listener button { padding: 4px 8px; border-radius: 8px; font-size: 12px; }
 .service .service-menu-toggle, .trace .service-menu-toggle {
@@ -370,6 +372,7 @@ main { display: grid; grid-template-columns: 280px minmax(360px, 1fr) 10px minma
   font-size: 13px;
 }
 .scan-results { min-width: 0; overflow: auto; padding: 0 14px 14px; }
+.healthcheck-results { min-width: 0; overflow: auto; padding: 14px; line-height: 1.6; overflow-wrap: anywhere; }
 .scan-group {
   margin: 10px 0 2px;
   color: var(--muted);
@@ -379,6 +382,7 @@ main { display: grid; grid-template-columns: 280px minmax(360px, 1fr) 10px minma
 }
 .discovered-listener { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 0; border-top: 1px solid var(--line); }
 .listener-details { min-width: 0; flex: 1; }
+.discovered-listener .name { overflow-wrap: anywhere; }
 .repo-badge { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border: 1px solid var(--line); border-radius: 999px; padding: 1px 6px; color: var(--muted); font: 10px/1.4 ui-monospace, "SF Mono", Menlo, monospace; }
 .discovered-listener .command { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .held { min-height: 42px; padding-inline: 18px; border-bottom: 1px solid var(--line); letter-spacing: 0; text-transform: none; }

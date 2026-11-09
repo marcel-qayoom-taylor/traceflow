@@ -4,6 +4,7 @@ const state = {
   gates: [],
   services: [],
   discovered: [],
+  discoveredProcesses: [],
   traces: [],
   sampleUrl: null,
   logEntries: [],
@@ -24,6 +25,7 @@ let scanPollTimer = null;
 let scanNote = '';
 let scanQuery = '';
 let scanModal = null;
+let healthcheckModal = null;
 let scanResults = null;
 let settingsOpen = false;
 let samplePending = false;
@@ -31,6 +33,7 @@ let sampleError = '';
 let openServiceMenu = null;
 const expandedTraceGroups = new Set();
 const pendingServiceActions = new Map();
+const serviceChecks = new Map();
 const pendingDiscoveredAttachments = new Set();
 
 const $ = (id) => document.getElementById(id);
@@ -86,8 +89,23 @@ function revealListeningServices(services) {
   if (changed) storeServicePreferences();
 }
 
+function isProcessService(service) {
+  return service?.kind === 'process';
+}
+
+// Process services have no address, so they are named by the command they follow.
+function serviceAddress(service) {
+  if (!isProcessService(service)) return `localhost:${service.port}`;
+  return (service.match || []).join(' ') || service.command || service.name;
+}
+
 function defaultServiceName(service) {
   if (!service) return '';
+  if (isProcessService(service)) {
+    // A configured service keeps the name it was given; a discovered one is named by its command.
+    const label = service.discovered ? serviceAddress(service) : service.name;
+    return service.repo ? `${service.repo} · ${label}` : label;
+  }
   const sharedRepo = service.repo
     && state.services.some((other) => other !== service && other.repo === service.repo);
   return service.repo
@@ -102,9 +120,9 @@ function serviceDisplayName(service) {
 function actorLabel(name) {
   const service = state.services.find((item) => item.name === name);
   if (!service) return { title: name, hint: '' };
-  const address = `localhost:${service.port}`;
-  const title = serviceAliases[service.name] || service.repo || address;
-  return { title, hint: title === address ? '' : address };
+  const address = serviceAddress(service);
+  const title = serviceAliases[service.name] || (isProcessService(service) ? defaultServiceName(service) : service.repo || address);
+  return { title, hint: title.includes(address) ? '' : address };
 }
 
 const ACTOR_FONT = '12px ui-monospace, "SF Mono", Menlo, monospace';
@@ -126,7 +144,8 @@ function textWidth(text, font) {
 
 function wrapDiagramLabel(text, maxWidth, font) {
   if (textWidth(text, font) <= maxWidth) return [text];
-  const tokens = text.split(/(?<=[./:_-])|\s+/).filter(Boolean);
+  // Break after separators and spaces, keeping each on its token so wrapped lines rejoin intact.
+  const tokens = text.split(/(?<=[./:_\-\s])(?=\S)/).filter(Boolean);
   const lines = [];
   let line = '';
   const pushHard = (token) => {
@@ -134,21 +153,21 @@ function wrapDiagramLabel(text, maxWidth, font) {
     while (textWidth(rest, font) > maxWidth) {
       let cut = rest.length - 1;
       while (cut > 1 && textWidth(rest.slice(0, cut), font) > maxWidth) cut -= 1;
-      lines.push(rest.slice(0, cut));
+      lines.push(rest.slice(0, cut).trimEnd());
       rest = rest.slice(cut);
     }
     return rest;
   };
   for (const token of tokens) {
     const next = line ? `${line}${token}` : token;
-    if (textWidth(next, font) <= maxWidth) {
+    if (textWidth(next.trimEnd(), font) <= maxWidth) {
       line = next;
       continue;
     }
-    if (line) lines.push(line);
+    if (line) lines.push(line.trimEnd());
     line = textWidth(token, font) > maxWidth ? pushHard(token) : token;
   }
-  if (line) lines.push(line);
+  if (line) lines.push(line.trimEnd());
   return lines.length ? lines : [text];
 }
 
@@ -462,9 +481,10 @@ function applyDelta(data) {
     logs = true;
   }
   if (Array.isArray(data.discovered)) {
-    const previous = discoveredKey(state.discovered);
+    const previous = discoveredKey(state.discovered, state.discoveredProcesses);
     state.discovered = data.discovered;
-    if (scanModal && discoveredKey(state.discovered) !== previous) renderScanResults();
+    if (Array.isArray(data.discoveredProcesses)) state.discoveredProcesses = data.discoveredProcesses;
+    if (scanModal && discoveredKey(state.discovered, state.discoveredProcesses) !== previous) renderScanResults();
     chrome = true;
   }
   if (data.clear) {
@@ -602,18 +622,24 @@ function settlePendingServiceActions() {
   if (changed) renderServices();
 }
 
-async function attachDiscovered(port) {
-  if (pendingDiscoveredAttachments.has(port)) return;
-  pendingDiscoveredAttachments.add(port);
+// target is { port } for a listener or { pid } for a process tree without a port.
+async function attachDiscovered(target) {
+  const key = discoveredTargetKey(target);
+  if (pendingDiscoveredAttachments.has(key)) return;
+  pendingDiscoveredAttachments.add(key);
   renderScanResults();
   try {
-    await post('/api/discovery/attach', { port });
+    await post('/api/discovery/attach', target);
   } catch {
-    // The listener remains available to retry after the request finishes.
+    // The listener or process remains available to retry after the request finishes.
   } finally {
-    pendingDiscoveredAttachments.delete(port);
+    pendingDiscoveredAttachments.delete(key);
     renderScanResults();
   }
+}
+
+function discoveredTargetKey(target) {
+  return target.pid !== undefined ? `pid:${target.pid}` : `port:${target.port}`;
 }
 
 function renderTransport() {
@@ -700,6 +726,42 @@ function renderSettings() {
     renderLogs();
   });
 
+  const stackControls = document.createElement('div');
+  const stacksButton = button('Manage stacks', async () => {
+    stacksButton.disabled = true;
+    stackControls.textContent = 'Loading stacks…';
+    try {
+      const response = await fetch('/api/stacks');
+      if (!response.ok) throw new Error('Could not load stacks');
+      const { stacks } = await response.json();
+      stackControls.replaceChildren();
+      if (!stacks.length) stackControls.textContent = 'Define named stacks in traceflow.config.json first.';
+      for (const stack of stacks) {
+        const row = document.createElement('div');
+        row.className = 'settings-row';
+        const label = document.createElement('span');
+        label.textContent = stack.name;
+        label.title = stack.services.join(', ');
+        const note = document.createElement('div');
+        note.className = 'settings-note';
+        note.setAttribute('role', 'status');
+        const start = button('Start', () => run('start'));
+        const stop = button('Stop owned', () => run('stop'));
+        async function run(action) {
+          start.disabled = stop.disabled = true;
+          note.textContent = action === 'start' ? 'Starting…' : 'Stopping owned services…';
+          try {
+            const result = await post(`/api/stacks/${encodeURIComponent(stack.name)}/${action}`);
+            note.textContent = result.results.map(item => `${item.service}: ${item.skipped ? 'unchanged' : item.reused ? 'reused' : action === 'start' ? 'started' : 'stopped'}`).join(' · ');
+          } catch (error) { note.textContent = error.message; }
+          finally { start.disabled = stop.disabled = false; }
+        }
+        row.append(label, start, stop);
+        stackControls.append(row, note);
+      }
+    } catch (error) { stackControls.textContent = error.message; }
+    finally { stacksButton.disabled = false; }
+  });
   const servicesHeading = document.createElement('div');
   servicesHeading.className = 'settings-heading';
   servicesHeading.textContent = 'Services';
@@ -710,7 +772,7 @@ function renderSettings() {
   const reattachNote = document.createElement('div');
   reattachNote.className = 'settings-note';
   reattachNote.textContent = 'Brings back services you have already attached when they restart.';
-  panel.append(captureHeading, captureRow, browserRow, browserNote, debugRow, debugNote, playbackHeading, responseRow, followRow, displayHeading, highlightRow, servicesHeading, reattachRow, reattachNote);
+  panel.append(captureHeading, captureRow, browserRow, browserNote, debugRow, debugNote, playbackHeading, responseRow, followRow, displayHeading, highlightRow, servicesHeading, reattachRow, reattachNote, stacksButton, stackControls);
   if (hiddenServices.size) {
     const restore = button(`Restore removed services (${hiddenServices.size})`, () => {
       hiddenServices.clear();
@@ -740,14 +802,14 @@ function serviceIndicator(service, pendingAction) {
     const action = pendingAction || 'stop';
     return { tone: 'yellow', label: `${action[0].toUpperCase()}${action.slice(1)}ing…` };
   }
+  if (service.status === 'running' && service.problem) {
+    return { tone: 'red', label: service.problem };
+  }
   if (service.status === 'running' && service.agent) {
     return { tone: 'green', label: 'Running and attached' };
   }
   if (service.status === 'running' && service.attached) {
     return { tone: 'yellow', label: 'Attached, waiting for agent' };
-  }
-  if (service.status === 'running' && service.problem) {
-    return { tone: 'red', label: service.problem };
   }
   if (service.status === 'running') {
     return { tone: 'yellow', label: 'Running, not attached' };
@@ -785,6 +847,7 @@ function renderServices() {
     menuToggle.setAttribute('aria-label', `More actions for ${displayName}`);
     menuToggle.setAttribute('aria-haspopup', 'menu');
     menuToggle.setAttribute('aria-expanded', String(openServiceMenu === service.name));
+    const check = serviceChecks.get(service.name);
     if (openServiceMenu === service.name) {
       const menu = document.createElement('div');
       menu.className = 'service-menu';
@@ -814,7 +877,34 @@ function renderServices() {
         renderLogs();
       });
       rename.setAttribute('role', 'menuitem');
-      menu.append(rename, remove);
+      const checkButton = button(check?.pending ? 'Checking…' : 'Healthcheck', async (event) => {
+        event.stopPropagation();
+        openServiceMenu = null;
+        serviceChecks.set(service.name, { pending: true });
+        renderServices();
+        const result = openHealthcheckModal(displayName);
+        try {
+          const response = await fetch(`/api/preflight?service=${encodeURIComponent(service.name)}`);
+          if (!response.ok) {
+            const body = await response.json().catch(() => ({}));
+            throw new Error(response.status === 404
+              ? 'Healthcheck unavailable. Restart Traceflow to load the latest server.'
+              : `Healthcheck failed: ${body.error || `HTTP ${response.status}`}`);
+          }
+          const report = await response.json();
+          const checks = report.services.flatMap(item => item.checks);
+          if (!checks.length) throw new Error('No healthcheck results for this service.');
+          result.replaceChildren(...checks.map(item => {
+            const line = document.createElement('div');
+            line.textContent = `${item.status}: ${item.message}`;
+            return line;
+          }));
+        } catch (error) { result.textContent = error.message; }
+        serviceChecks.delete(service.name);
+        renderServices();
+      }, { disabled: check?.pending });
+      checkButton.setAttribute('role', 'menuitem');
+      menu.append(checkButton, rename, remove);
       card.append(menu);
     }
     const row = document.createElement('div');
@@ -826,14 +916,22 @@ function renderServices() {
     name.className = 'name';
     const dot = document.createElement('i');
     dot.className = `dot status-${indicator.tone}`;
-    const statusText = `${indicator.label} · localhost:${service.port}`;
+    const statusText = `${indicator.label} · ${isProcessService(service) ? `process: ${service.command}` : `localhost:${service.port}`}`;
     const attachNote = service.status === 'running' && !service.agent ? (service.problem || service.message) : '';
     dot.title = attachNote ? `${statusText}. ${attachNote}` : statusText;
     dot.setAttribute('aria-label', statusText);
     name.append(dot, document.createTextNode(displayName));
     const meta = document.createElement('div');
     meta.className = 'meta';
-    meta.textContent = String(service.port);
+    if (isProcessService(service)) {
+      meta.textContent = service.processes > 1 ? `${service.processes} processes` : 'process';
+      meta.title = service.command;
+    } else {
+      meta.textContent = String(service.port);
+    }
+    if (service.owner) {
+      meta.textContent += service.owner === 'traceflow' ? ' · started here' : ' · external';
+    }
     row.append(name);
     row.addEventListener('click', () => selectServiceLogs(service.name));
     row.addEventListener('keydown', (event) => {
@@ -853,6 +951,15 @@ function renderServices() {
     footer.className = 'service-footer';
     footer.append(meta, actions);
     card.append(menuToggle, row, footer);
+    // Why a service is not attached (or failed) stays visible instead of only in the dot's tooltip.
+    const prerequisiteWarning = (service.prerequisites || []).map(check => check.message).join('; ');
+    const noteText = pendingAction ? '' : service.problem || prerequisiteWarning || attachNote;
+    if (noteText) {
+      const note = document.createElement('div');
+      note.className = service.problem ? 'service-note problem' : 'service-note';
+      note.textContent = noteText;
+      card.append(note);
+    }
     root.append(card);
   }
 }
@@ -1167,7 +1274,7 @@ function renderDiagram() {
       ? `Could not send the sample request: ${sampleError}`
       : state.demo
         ? 'Send the sample request to see the flow.'
-        : 'Start a configured service, or scan and attach to a running Node.js service.';
+        : 'Start a configured service, or scan and attach to a running Node.js service or process.';
     if (sampleError) empty.classList.add('error');
     root.append(empty);
     return;
@@ -1589,18 +1696,27 @@ function diagramText(className, x, y, lines, lineHeight) {
   return text;
 }
 
+function scanMatches(item, query) {
+  if (!query) return true;
+  return String(item.port ?? '').includes(query)
+    || String(item.pid).includes(query)
+    || (item.repoPath || '').toLowerCase().includes(query)
+    || (item.workingDirectory || '').toLowerCase().includes(query)
+    || (item.command || '').toLowerCase().includes(query);
+}
+
 function visibleListeners() {
   const query = scanQuery.trim().toLowerCase();
   return state.discovered
-    .filter((listener) => {
-      if (!query) return true;
-      return String(listener.port).includes(query)
-        || String(listener.pid).includes(query)
-        || (listener.repoPath || '').toLowerCase().includes(query)
-        || (listener.workingDirectory || '').toLowerCase().includes(query)
-        || (listener.command || '').toLowerCase().includes(query);
-    })
+    .filter((listener) => scanMatches(listener, query))
     .sort((a, b) => a.port - b.port || a.pid - b.pid);
+}
+
+function visibleProcesses() {
+  const query = scanQuery.trim().toLowerCase();
+  return state.discoveredProcesses
+    .filter((group) => scanMatches(group, query))
+    .sort((a, b) => (a.repo || '').localeCompare(b.repo || '') || a.pid - b.pid);
 }
 
 function stopScanPolling() {
@@ -1611,6 +1727,42 @@ function stopScanPolling() {
 function startScanPolling() {
   stopScanPolling();
   scanPollTimer = setInterval(() => { void refreshOpenScan(); }, SCAN_POLL_MS);
+}
+
+function closeHealthcheckModal() {
+  healthcheckModal?.remove();
+  healthcheckModal = null;
+}
+
+function openHealthcheckModal(name) {
+  closeHealthcheckModal();
+  const backdrop = document.createElement('div');
+  healthcheckModal = backdrop;
+  backdrop.className = 'modal-backdrop';
+  backdrop.addEventListener('pointerdown', (event) => {
+    if (event.target === backdrop) closeHealthcheckModal();
+  });
+  const dialog = document.createElement('div');
+  dialog.className = 'scan-dialog';
+  dialog.setAttribute('role', 'dialog');
+  dialog.setAttribute('aria-modal', 'true');
+  dialog.setAttribute('aria-labelledby', 'healthcheck-title');
+  const head = document.createElement('div');
+  head.className = 'scan-dialog-head';
+  const title = document.createElement('span');
+  title.id = 'healthcheck-title';
+  title.textContent = `Healthcheck: ${name}`;
+  const close = button('Close', closeHealthcheckModal, { className: 'text' });
+  head.append(title, close);
+  const result = document.createElement('div');
+  result.className = 'healthcheck-results';
+  result.setAttribute('role', 'status');
+  result.textContent = 'Checking…';
+  dialog.append(head, result);
+  backdrop.append(dialog);
+  document.body.append(backdrop);
+  close.focus();
+  return result;
 }
 
 function closeScanModal() {
@@ -1626,55 +1778,89 @@ function syncScanButton() {
   scan.textContent = scanning ? 'Scanning' : 'Scan';
 }
 
+function scanStatus(text) {
+  const status = document.createElement('div');
+  status.className = 'meta discovery-status';
+  status.textContent = text;
+  return status;
+}
+
+function scanSection(title) {
+  const heading = document.createElement('div');
+  heading.className = 'scan-group';
+  heading.textContent = title;
+  return heading;
+}
+
+function discoveredRow({ name, repo, location, target, attachable, disabledLabel }) {
+  const row = document.createElement('div');
+  row.className = 'discovered-listener';
+  const details = document.createElement('div');
+  details.className = 'listener-details';
+  const label = document.createElement('div');
+  label.className = 'name';
+  label.textContent = name;
+  if (repo) {
+    const badge = document.createElement('span');
+    badge.className = 'repo-badge';
+    badge.textContent = repo;
+    label.append(badge);
+  }
+  const command = document.createElement('div');
+  command.className = 'meta command';
+  command.textContent = location;
+  command.title = location;
+  details.append(label, command);
+  const attaching = pendingDiscoveredAttachments.has(discoveredTargetKey(target));
+  row.append(details, button(attaching ? 'Attaching…' : attachable ? 'Attach' : disabledLabel, () => { void attachDiscovered(target); }, { disabled: attaching || !attachable }));
+  return row;
+}
+
 function renderScanResults() {
   if (!scanResults) return;
   scanResults.replaceChildren();
   if (scanning) {
-    const status = document.createElement('div');
-    status.className = 'meta discovery-status';
-    status.textContent = 'Scanning ports…';
-    scanResults.append(status);
+    scanResults.append(scanStatus('Scanning ports and processes…'));
     return;
   }
-  if (scanNote && !state.discovered.length) {
-    const status = document.createElement('div');
-    status.className = 'meta discovery-status';
-    status.textContent = scanNote;
-    scanResults.append(status);
+  const nothingFound = !state.discovered.length && !state.discoveredProcesses.length;
+  if (scanNote && nothingFound) {
+    scanResults.append(scanStatus(scanNote));
     return;
   }
   const listeners = visibleListeners();
+  const processes = visibleProcesses();
+  // Processes come first: the list is usually short, so it stays in view above a long port list.
+  scanResults.append(scanSection('Processes without a port'));
+  if (!processes.length) {
+    scanResults.append(scanStatus(state.discoveredProcesses.length
+      ? 'No matching processes.'
+      : 'No other Node.js processes started from a terminal in a git repository.'));
+  }
+  for (const group of processes) {
+    const count = group.processes > 1 ? ` · ${group.processes} Node processes` : '';
+    scanResults.append(discoveredRow({
+      name: group.command,
+      repo: group.repo,
+      location: `${group.workingDirectory || group.repoPath || ''} · pid ${group.pid}${count}`,
+      target: { pid: group.pid },
+      attachable: group.attachable,
+      disabledLabel: 'No Node',
+    }));
+  }
+  scanResults.append(scanSection('Ports'));
   if (!listeners.length) {
-    const status = document.createElement('div');
-    status.className = 'meta discovery-status';
-    status.textContent = state.discovered.length ? 'No matching listeners.' : 'No other Node.js listeners.';
-    scanResults.append(status);
-    return;
+    scanResults.append(scanStatus(state.discovered.length ? 'No matching listeners.' : 'No other Node.js listeners.'));
   }
   for (const listener of listeners) {
-    const row = document.createElement('div');
-    row.className = 'discovered-listener';
-    const details = document.createElement('div');
-    details.className = 'listener-details';
-    const label = document.createElement('div');
-    label.className = 'name';
-    label.textContent = `:${listener.port}`;
-    const repoName = listener.repo || null;
-    if (repoName) {
-      const repo = document.createElement('span');
-      repo.className = 'repo-badge';
-      repo.textContent = repoName;
-      label.append(repo);
-    }
-    const command = document.createElement('div');
-    command.className = 'meta command';
-    const location = listener.repoPath || listener.workingDirectory || `pid ${listener.pid}`;
-    command.textContent = location;
-    command.title = location;
-    details.append(label, command);
-    const attaching = pendingDiscoveredAttachments.has(listener.port);
-    row.append(details, button(attaching ? 'Attaching…' : listener.attachable ? 'Attach' : 'Not Node', () => { void attachDiscovered(listener.port); }, { disabled: attaching || !listener.attachable }));
-    scanResults.append(row);
+    scanResults.append(discoveredRow({
+      name: `:${listener.port}`,
+      repo: listener.repo,
+      location: listener.repoPath || listener.workingDirectory || `pid ${listener.pid}`,
+      target: { port: listener.port },
+      attachable: listener.attachable,
+      disabledLabel: 'Not Node',
+    }));
   }
 }
 
@@ -1696,14 +1882,14 @@ function openScanModal() {
   head.className = 'scan-dialog-head';
   const title = document.createElement('strong');
   title.id = 'scan-title';
-  title.textContent = 'Ports';
+  title.textContent = 'Attach to a running service';
   head.append(title, button('Close', closeScanModal, { className: 'text' }));
   const search = document.createElement('div');
   search.className = 'scan-search';
   const input = document.createElement('input');
   input.id = 'scan-search';
   input.type = 'search';
-  input.placeholder = 'Filter Node.js port or repository';
+  input.placeholder = 'Filter by port, command or repository';
   input.value = scanQuery;
   input.addEventListener('input', () => {
     scanQuery = input.value;
@@ -1729,7 +1915,11 @@ async function requestScan() {
   });
   const body = await response.json().catch(() => ({}));
   if (!response.ok || body.ok === false) return { ok: false, error: body.error || 'Could not scan ports' };
-  return { ok: true, listeners: Array.isArray(body.listeners) ? body.listeners : [] };
+  return {
+    ok: true,
+    listeners: Array.isArray(body.listeners) ? body.listeners : [],
+    processes: Array.isArray(body.processes) ? body.processes : [],
+  };
 }
 
 function applyScanResult(result) {
@@ -1738,7 +1928,8 @@ function applyScanResult(result) {
     return;
   }
   state.discovered = result.listeners;
-  scanNote = result.listeners.length ? '' : 'No other Node.js listeners.';
+  state.discoveredProcesses = result.processes;
+  scanNote = result.listeners.length || result.processes.length ? '' : 'No other Node.js listeners or processes.';
 }
 
 async function refreshOpenScan() {
@@ -1747,15 +1938,15 @@ async function refreshOpenScan() {
   try {
     const result = await requestScan();
     if (!scanModal) return;
-    const previous = discoveredKey(state.discovered);
+    const previous = discoveredKey(state.discovered, state.discoveredProcesses);
     applyScanResult(result);
     if (result.ok) {
-      if (discoveredKey(state.discovered) !== previous) renderScanResults();
-    } else if (!state.discovered.length) {
+      if (discoveredKey(state.discovered, state.discoveredProcesses) !== previous) renderScanResults();
+    } else if (!state.discovered.length && !state.discoveredProcesses.length) {
       renderScanResults();
     }
   } catch {
-    if (!scanModal || state.discovered.length) return;
+    if (!scanModal || state.discovered.length || state.discoveredProcesses.length) return;
     scanNote = 'Could not scan ports';
     renderScanResults();
   } finally {
@@ -1763,14 +1954,17 @@ async function refreshOpenScan() {
   }
 }
 
-function discoveredKey(listeners) {
-  return listeners.map((listener) => [
-    listener.port,
-    listener.pid,
-    listener.repo || '',
-    listener.repoPath || '',
-    listener.workingDirectory || '',
-    listener.attachable ? 1 : 0,
+function discoveredKey(listeners, processes = []) {
+  return [...listeners, ...processes].map((item) => [
+    item.kind || 'port',
+    item.port ?? '',
+    item.pid,
+    item.command || '',
+    item.processes ?? '',
+    item.repo || '',
+    item.repoPath || '',
+    item.workingDirectory || '',
+    item.attachable ? 1 : 0,
   ].join('\0')).join('\n');
 }
 
@@ -1862,6 +2056,11 @@ $('log-title').addEventListener('click', () => {
   renderLogs();
 });
 window.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && healthcheckModal) {
+    event.preventDefault();
+    closeHealthcheckModal();
+    return;
+  }
   if (event.key === 'Escape' && settingsOpen) {
     event.preventDefault();
     settingsOpen = false;

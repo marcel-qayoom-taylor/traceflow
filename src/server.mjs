@@ -1,13 +1,34 @@
 #!/usr/bin/env node
 
 import http from 'node:http';
+import { preflight, readiness, healthStatus } from './preflight.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { attachToListener, killListener, launchTarget, listenerOn, listeners, listenersByPort, repositoryName, stopListener, workingDirectoryForCommand } from './attach.mjs';
+import {
+  attachToListener,
+  attachToPid,
+  killListener,
+  launchTarget,
+  listenerOn,
+  listeners,
+  listenersByPort,
+  locateProcess,
+  matchTokens,
+  pidAlive,
+  processCwds,
+  processGroups,
+  processTable,
+  processTargets,
+  repositoryName,
+  signalProcessTree,
+  stopListener,
+  subtree,
+  workingDirectoryForCommand,
+} from './attach.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const agentPath = path.join(root, 'src', 'agent', 'preload.cjs');
@@ -58,7 +79,11 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
   const logEntries = [];
   const logRest = new Map();
   const runtimes = new Map();
+  const stackRuns = new Map();
+  const startsInFlight = new Map();
+  let stackBusy = false;
   let discovered = [];
+  let discoveredProcesses = [];
   const clients = new Set();
   const controlClients = new Set();
   let deltaQueued = false;
@@ -69,9 +94,11 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
   let expireTimer = null;
   let controlPing = null;
   const pendingLogs = [];
-  const reattaching = new Set();
+  // Attaches in progress per service, so the refresh loop never starts a second one alongside.
+  const attachesInFlight = new Map();
   const DIFFERENT_PROJECT = 'A different project is listening on this port, so it was left unattached.';
   const NOT_NODE = 'The process on this port is not Node, so it was left unattached.';
+  const NO_NODE_PROCESS = 'No Node.js process is running under this command yet, so nothing was attached.';
   const maxTraces = limits?.maxTraces ?? 200;
   const maxSpans = limits?.maxSpans ?? 200;
   const incompleteTtlMs = limits?.incompleteTtlMs ?? 5 * 60 * 1000;
@@ -87,21 +114,31 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
   };
 
   for (const service of activeConfig.services) {
-    runtimes.set(service.name, {
+    runtimes.set(service.name, newRuntime({
+      repo: repositoryName(path.resolve(activeConfig.baseDir || root, service.cwd || '.')),
+    }));
+  }
+
+  function newRuntime(overrides = {}) {
+    return {
       status: 'stopped',
       pid: null,
       exitCode: null,
       child: null,
       owner: null,
       attachedPid: null,
+      // Process services: the Node pids under the matched command, and the set last attached.
+      targets: [],
+      attachedTargets: '',
       message: '',
       problem: '',
-      repo: repositoryName(path.resolve(activeConfig.baseDir || root, service.cwd || '.')),
-    });
+      repo: null,
+      ...overrides,
+    };
   }
 
   function peerTable() {
-    const peers = activeConfig.services.map((service) => ({
+    const peers = activeConfig.services.filter(hasPort).map((service) => ({
       port: service.port,
       service: service.name,
     }));
@@ -129,6 +166,7 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
       gates: gates.map(gateView),
       services: activeConfig.services.map(serviceView),
       discovered,
+      discoveredProcesses: discoveredProcesses.map(discoveredProcessView),
       traces: listedTraces(),
       logEntries: [...logEntries],
       sampleUrl: demo ? '/api/sample' : null,
@@ -138,21 +176,42 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
   function serviceView(service) {
     const runtime = runtimes.get(service.name);
     const seen = agents.get(service.name) || 0;
+    const processService = isProcessService(service);
     return {
       name: service.name,
-      port: service.port,
+      kind: processService ? 'process' : 'port',
+      port: processService ? null : service.port,
+      match: processService ? processMatch(service) : null,
+      processes: processService ? runtime?.targets.length || 0 : null,
       color: service.color || SERVICE_COLORS[activeConfig.services.indexOf(service) % SERVICE_COLORS.length],
       status: runtime?.status || 'stopped',
       pid: runtime?.pid || null,
       exitCode: runtime?.exitCode ?? null,
       owner: runtime?.owner || null,
-      attached: Boolean(runtime?.attachedPid && runtime.attachedPid === runtime.pid),
+      attached: processService
+        ? Boolean(runtime?.attachedTargets && runtime.attachedTargets === targetKey(runtime.targets))
+        : Boolean(runtime?.attachedPid && runtime.attachedPid === runtime.pid),
       discovered: Boolean(service.discovered),
       message: runtime?.message || '',
-      problem: runtime?.problem || '',
+      problem: processService && runtime?.status === 'running' && !runtime?.targets.length ? 'Worker process not detected' : runtime?.problem || '',
+      prerequisites: runtime?.prerequisites || [],
       repo: runtime?.repo || service.repo || null,
       agent: Date.now() - seen < 5000,
       command: service.command || `node ${service.args?.join(' ')}`,
+    };
+  }
+
+  function discoveredProcessView(group) {
+    return {
+      kind: 'process',
+      pid: group.pid,
+      command: group.command,
+      match: group.match,
+      workingDirectory: group.workingDirectory,
+      repo: group.repo,
+      repoPath: group.repoPath,
+      processes: group.processes,
+      attachable: group.attachable,
     };
   }
 
@@ -256,6 +315,7 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
     if (dirty.services) {
       packet.services = activeConfig.services.map(serviceView);
       packet.discovered = discovered;
+      packet.discoveredProcesses = discoveredProcesses.map(discoveredProcessView);
     }
     if (dirty.control) packet.control = { ...control };
     if (dirty.gates) packet.gates = gates.map(gateView);
@@ -280,7 +340,7 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
   }
 
   function pushLog(service, line, meta = {}) {
-    const clean = stripAnsi(String(line)).trimEnd();
+    const clean = logText(line);
     if (!clean) return;
     const entry = {
       service,
@@ -300,6 +360,72 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
       const batch = pendingLogs.splice(0, pendingLogs.length);
       send('log', batch);
     }, 80);
+  }
+
+  // A service Traceflow starts writes each line twice: to the stdout pipe, and through its agent to
+  // /ingest with the request it belongs to. Piped lines wait briefly so the agent's linked copy is
+  // kept and the piped copy dropped; output from processes without an agent still appears.
+  const PIPE_HOLD_MS = 300;
+  const ECHO_WINDOW_MS = 2000;
+  const heldLines = [];
+  const recentLines = new Map();
+  let heldTimer = null;
+
+  function rememberLine(service, source, text) {
+    const key = `${service}\0${source}`;
+    if (!recentLines.has(key)) recentLines.set(key, new Map());
+    const bucket = recentLines.get(key);
+    if (!bucket.has(text)) bucket.set(text, []);
+    bucket.get(text).push(Date.now());
+    if (bucket.size > 1000) bucket.delete(bucket.keys().next().value);
+  }
+
+  function takeLine(service, source, text) {
+    const bucket = recentLines.get(`${service}\0${source}`);
+    const times = bucket?.get(text);
+    if (!times) return false;
+    const now = Date.now();
+    while (times.length && now - times[0] > ECHO_WINDOW_MS) times.shift();
+    const found = times.length > 0;
+    if (found) times.shift();
+    if (!times.length) bucket.delete(text);
+    return found;
+  }
+
+  function holdPipedLine(service, line) {
+    heldLines.push({ service, line, text: logText(line), at: Date.now() });
+    scheduleHeldLines();
+  }
+
+  function scheduleHeldLines() {
+    if (heldTimer || !heldLines.length) return;
+    heldTimer = setTimeout(() => {
+      heldTimer = null;
+      releaseHeldLines();
+    }, Math.max(0, heldLines[0].at + PIPE_HOLD_MS - Date.now()));
+    heldTimer.unref?.();
+  }
+
+  // Release piped lines that have waited long enough, or every line of `service` when it exits.
+  function releaseHeldLines(service = null) {
+    const now = Date.now();
+    for (let index = 0; index < heldLines.length;) {
+      const held = heldLines[index];
+      if (held.service !== service && now - held.at < PIPE_HOLD_MS) {
+        index += 1;
+        continue;
+      }
+      heldLines.splice(index, 1);
+      if (takeLine(held.service, 'agent', held.text)) continue;
+      pushLog(held.service, held.line, { at: held.at });
+      rememberLine(held.service, 'pipe', held.text);
+    }
+    scheduleHeldLines();
+  }
+
+  function forgetLines(service) {
+    recentLines.delete(`${service}\0agent`);
+    recentLines.delete(`${service}\0pipe`);
   }
 
   function evictTraces() {
@@ -442,24 +568,117 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
     noteGates();
   }
 
+  async function servicePreflight(name, { requireRunning = false } = {}) {
+    const spec = activeConfig.services.find(service => service.name === name);
+    if (!spec) return { service: name, ok: false, status: 'unhealthy', checks: [{ check: 'configuration', status: 'error', message: 'Service is not configured' }] };
+    const cwd = path.resolve(activeConfig.baseDir || root, spec.cwd || '.');
+    const listener = hasPort(spec) ? listenerOn(spec.port) : null;
+    const running = hasPort(spec)
+      ? Boolean(listener && sameProcessIdentity(spec, { workingDirectory: launchTarget(listener.pid)?.cwd }))
+      : Boolean(runtimes.get(name)?.child || locateService(spec)?.root);
+    const report = await preflight(spec, { baseDir: activeConfig.baseDir || root, nodeBin: nodeBinForProject(cwd), listener, running });
+    if (requireRunning) {
+      report.checks.push({ check: 'running', status: running ? 'ok' : 'error', message: running ? 'Service is running' : 'Service is not running' });
+      if (!running) report.ok = false;
+    }
+    if (isProcessService(spec) && running) {
+      const seen = agents.get(name);
+      const recent = seen && Date.now() - seen < 5000;
+      report.checks.push({ check: 'agent-heartbeat', status: recent ? 'ok' : 'warn', message: recent ? 'Traceflow agent heartbeat received; queue connectivity and job progress are not verified' : 'No recent Traceflow agent heartbeat; queue connectivity and job progress are not verified', ...(seen ? { lastSeen: new Date(seen).toISOString() } : {}) });
+    }
+    report.status = healthStatus(report.checks);
+    return report;
+  }
+
+  async function stackAction(name, action) {
+    if (!['start', 'stop'].includes(action)) return { ok: false, error: 'Unknown stack action' };
+    if (stackBusy) return { ok: false, error: 'Another stack operation is in progress' };
+    const members = activeConfig.stacks?.[name];
+    const names = new Set(activeConfig.services.map(service => service.name));
+    if (!Array.isArray(members) || !members.length || members.some(member => !names.has(member))) {
+      return { ok: false, error: 'Unknown stack or invalid service members' };
+    }
+    stackBusy = true;
+    try {
+      const owned = stackRuns.get(name) || new Map();
+      stackRuns.set(name, owned);
+      const results = [];
+      for (const member of action === 'stop' ? [...members].reverse() : members) {
+        const runtime = runtimes.get(member);
+        if (action === 'stop') {
+          // Child identity prevents cleanup from stopping a replacement process, even if a PID is reused.
+          if (!owned.has(member) || runtime?.owner !== 'traceflow' || runtime.child !== owned.get(member)) {
+            results.push({ service: member, ok: true, skipped: true });
+            owned.delete(member);
+            continue;
+          }
+          const result = await stopService(member);
+          results.push({ service: member, ...result });
+          if (result.ok) owned.delete(member);
+        } else {
+          const spec = activeConfig.services.find(service => service.name === member);
+          const existing = runtime?.child || (hasPort(spec) ? listenerOn(spec.port) : locateService(spec)?.root);
+          if (existing) {
+            const checks = await servicePreflight(member);
+            results.push({ service: member, ok: checks.ok, reused: true, preflight: checks });
+            if (!checks.ok) break;
+            continue;
+          }
+          const alreadyStarting = startsInFlight.has(member);
+          const result = await startService(member);
+          if (result.ok && result.pid && !alreadyStarting) owned.set(member, runtime.child);
+          if (result.ok && spec.healthPath) {
+            const deadline = Date.now() + 10_000;
+            let ready;
+            do {
+              ready = await readiness(spec, Boolean(runtime.child), Math.max(1, Math.min(2000, deadline - Date.now())));
+              if (ready.status === 'ok') break;
+              await new Promise(resolve => setTimeout(resolve, Math.max(0, Math.min(500, deadline - Date.now()))));
+            } while (runtime.child && Date.now() < deadline);
+            result.readiness = ready;
+            result.ok = ready.status === 'ok';
+            if (!result.ok) result.error = 'Service did not become ready within 10 seconds';
+          }
+          results.push({ service: member, ...result });
+          if (!result.ok) break;
+        }
+      }
+      const failed = results.find(result => !result.ok);
+      return { ok: !failed, stack: name, results, ...(failed ? { error: failed.error || `Preflight failed for ${failed.service}` } : {}) };
+    } finally { stackBusy = false; }
+  }
+
   async function startService(name) {
+    if (startsInFlight.has(name)) return startsInFlight.get(name);
+    const operation = startServiceImpl(name).finally(() => startsInFlight.delete(name));
+    startsInFlight.set(name, operation);
+    return operation;
+  }
+
+  async function startServiceImpl(name) {
     const spec = activeConfig.services.find((service) => service.name === name);
     if (!spec) return { ok: false, error: 'unknown service' };
     const runtime = runtimes.get(name);
     if (runtime?.owner === 'traceflow' && runtime.status === 'running' && runtime.child) return { ok: true, status: 'running' };
     if (!spec.cwd) spec.cwd = workingDirectoryForCommand(spec.command) || '';
-    const listener = listenerOn(spec.port);
-    if (listener) {
-      runtime.message = `Already running in your terminal (pid ${listener.pid}). Stop it before starting a new one.`;
+    const runningPid = hasPort(spec) ? listenerOn(spec.port)?.pid : locateService(spec)?.root;
+    if (runningPid) {
+      runtime.message = `Already running in your terminal (pid ${runningPid}). Stop it before starting a new one.`;
       runtime.problem = runtime.message;
       noteServices();
       return { ok: false, error: runtime.message };
     }
     const cwd = path.resolve(activeConfig.baseDir || root, spec.cwd || '.');
+    const checks = await servicePreflight(name);
+    runtime.prerequisites = checks.checks?.filter(check => check.status !== 'ok' && check.check !== 'readiness') || [];
+    // Readiness is evaluated after startup; only launch prerequisites block Start.
+    if (checks.checks?.some(check => check.status === 'error' && check.check !== 'readiness')) {
+      return { ok: false, error: checks.checks.filter(check => check.status === 'error' && check.check !== 'readiness').map(check => check.message).join('; '), preflight: checks };
+    }
     const env = {
       ...process.env,
       ...spec.env,
-      PORT: String(spec.port),
+      ...(hasPort(spec) ? { PORT: String(spec.port) } : {}),
       TRACEFLOW_SERVICE: spec.name,
       TRACEFLOW_INGEST: `http://127.0.0.1:${listenPort}`,
       TRACEFLOW_TOKEN: sessionToken,
@@ -470,12 +689,14 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
     const nodeBin = nodeBinForProject(cwd);
     if (nodeBin) env.PATH = `${nodeBin}${path.delimiter}${env.PATH || ''}`;
     const child = spec.args
-      ? spawn(process.execPath, spec.args, { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
+      ? spawn(nodeBin ? path.join(nodeBin, 'node') : process.execPath, spec.args, { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
       : spawn('bash', ['-c', spec.command], { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
     runtime.child = child;
     runtime.pid = child.pid;
     runtime.status = 'running';
     runtime.owner = 'traceflow';
+    runtime.targets = [];
+    runtime.attachedTargets = '';
     runtime.message = '';
     runtime.problem = '';
     runtime.repo = repositoryName(cwd);
@@ -484,11 +705,13 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
       const key = `${name}:rest`;
       const split = takeLogLines(logRest.get(key) || '', chunk.toString('utf8'));
       logRest.set(key, split.rest);
-      for (const line of split.lines) pushLog(name, line);
+      for (const line of split.lines) holdPipedLine(name, line);
     };
     child.stdout.on('data', take);
     child.stderr.on('data', take);
     child.on('exit', (code, signal) => {
+      releaseHeldLines(name);
+      forgetLines(name);
       const stoppedByUser = runtime.status === 'stopping';
       const reason = code !== null ? `code ${code}` : signal ? `signal ${signal}` : 'unknown reason';
       runtime.status = stoppedByUser ? 'stopped' : 'exited';
@@ -532,15 +755,16 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
         try { process.kill(-pid, 'SIGKILL'); } catch { /* already gone */ }
       }, 1500);
       killer.unref?.();
-      const stopped = await waitForPortToStop(spec.port);
+      const stopped = hasPort(spec) ? await waitForPortToStop(spec.port) : await waitForGroupToExit(pid);
       clearTimeout(killer);
       if (stopped) return { ok: true };
       runtime.status = 'running';
-      runtime.message = `Process is still listening on ${spec.port}`;
+      runtime.message = hasPort(spec) ? `Process is still listening on ${spec.port}` : `Process group ${pid} is still running`;
       runtime.problem = runtime.message;
       noteServices();
       return { ok: false, error: runtime.message };
     }
+    if (isProcessService(spec)) return stopTerminalProcess(spec, runtime);
     const listener = listenerOn(spec.port);
     if (!listener) {
       runtime.status = 'stopped';
@@ -590,38 +814,140 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
     }
   }
 
-  async function waitForPortToStop(port, timeoutMs = 5000) {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      if (!listenerOn(port)) return true;
-      await sleep(100);
+  async function stopTerminalProcess(spec, runtime) {
+    const found = locateService(spec);
+    if (!found) {
+      markStopped(runtime);
+      noteServices();
+      return { ok: true };
     }
-    return !listenerOn(port);
+    runtime.status = 'stopping';
+    runtime.message = 'Stopping…';
+    runtime.problem = '';
+    noteServices();
+    const gone = () => !found.pids.some(pidAlive);
+    signalProcessTree(found.root, 'SIGTERM');
+    if (!await waitUntil(gone, 2000)) signalProcessTree(found.root, 'SIGKILL');
+    if (!await waitUntil(gone, 2000)) {
+      runtime.status = 'running';
+      runtime.pid = found.root;
+      runtime.owner = 'terminal';
+      runtime.message = `Process ${found.root} is still running`;
+      runtime.problem = runtime.message;
+      noteServices();
+      return { ok: false, error: runtime.message };
+    }
+    markStopped(runtime);
+    pushLog(spec.name, `[traceflow] stopped pid ${found.root}`);
+    noteServices();
+    return { ok: true, pid: found.root };
   }
 
-  async function attachService(name, { remember = false } = {}) {
+  function markStopped(runtime) {
+    runtime.status = 'stopped';
+    runtime.pid = null;
+    runtime.owner = null;
+    runtime.attachedPid = null;
+    runtime.targets = [];
+    runtime.attachedTargets = '';
+    runtime.message = '';
+    runtime.problem = '';
+  }
+
+  async function waitForPortToStop(port, timeoutMs = 5000) {
+    return waitUntil(() => !listenerOn(port), timeoutMs);
+  }
+
+  // A started service is its own process group, so the whole tree is gone once the group is empty.
+  async function waitForGroupToExit(pgid, timeoutMs = 5000) {
+    return waitUntil(() => !groupAlive(pgid), timeoutMs);
+  }
+
+  /** Locate the running process tree for a process service, ignoring trees Traceflow started itself. */
+  function locateService(spec, table = processTable()) {
+    if (!table) return null;
+    return locateProcess(table, { tokens: processMatch(spec), cwd: processDirectory(spec) }, {
+      exclude: ownedPids(table),
+      cwdOf: cachedCwds(table),
+    });
+  }
+
+  // Relative and missing working directories resolve from the config file, as Start does, so a
+  // configured command never matches (or stops) the same command in an unrelated project.
+  function processDirectory(spec) {
+    return canonicalDirectory(path.resolve(activeConfig.baseDir || root, spec.cwd || '.'));
+  }
+
+  // Working directories by pid, kept while the pid is alive, so polling does not run lsof each tick.
+  const cwdCache = new Map();
+  function cachedCwds(table) {
+    if (!table) return processCwds;
+    for (const pid of cwdCache.keys()) {
+      if (!table.byPid.has(pid)) cwdCache.delete(pid);
+    }
+    return (pids) => {
+      const missing = pids.filter((pid) => !cwdCache.has(pid));
+      if (missing.length) {
+        const found = processCwds(missing);
+        for (const pid of missing) cwdCache.set(pid, found.get(pid) || null);
+      }
+      return new Map(pids.map((pid) => [pid, cwdCache.get(pid) || undefined]));
+    };
+  }
+
+  function ownedPids(table) {
+    const pids = new Set();
+    for (const runtime of runtimes.values()) {
+      if (runtime.owner !== 'traceflow' || !runtime.child?.pid) continue;
+      for (const pid of subtree(table, runtime.child.pid)) pids.add(pid);
+    }
+    return pids;
+  }
+
+  async function attachService(name, options = {}) {
+    attachesInFlight.set(name, (attachesInFlight.get(name) || 0) + 1);
+    try {
+      return await attachServiceNow(name, options);
+    } finally {
+      const left = attachesInFlight.get(name) - 1;
+      if (left > 0) attachesInFlight.set(name, left);
+      else attachesInFlight.delete(name);
+    }
+  }
+
+  async function attachServiceNow(name, { remember = false } = {}) {
     const spec = activeConfig.services.find((service) => service.name === name);
     const runtime = runtimes.get(name);
     if (!spec || !runtime) return { ok: false, error: 'unknown service' };
     if (remember) spec.sticky = true;
+    const checks = await servicePreflight(name);
+    runtime.prerequisites = checks.checks?.filter(check => check.status !== 'ok' && check.check !== 'readiness') || [];
+    noteServices();
     try {
       const previousHello = agents.get(spec.name) || 0;
-      const result = await attachToListener({
-        port: spec.port,
+      const options = {
         service: spec.name,
         ingest: `http://127.0.0.1:${listenPort}`,
         token: sessionToken,
         peers: peerTable(),
         control,
         agentPath,
-      });
+      };
+      const result = isProcessService(spec)
+        ? await attachProcess(spec, runtime, options)
+        : await attachToListener({ ...options, port: spec.port });
       if (result.ok && !(await waitForFreshAgent(spec.name, previousHello))) {
         result.ok = false;
         result.error = 'The agent loaded, but did not connect to Traceflow. Restart the service once, then attach again.';
       }
-      runtime.message = result.ok ? '' : result.error;
+      runtime.message = result.ok ? result.warning || '' : result.error;
       runtime.problem = result.ok || runtime.status === 'running' ? '' : result.error;
-      if (result.ok) {
+      if (result.ok && isProcessService(spec)) {
+        runtime.attachedTargets = targetKey(result.targets);
+        pushLog(name, `[traceflow] attached to pid ${result.pids.join(', ')}`);
+        if (result.warning) pushLog(name, `[traceflow] ${result.warning}`);
+        if (spec.sticky) saveRememberedServices(activeConfig);
+      } else if (result.ok) {
         runtime.attachedPid = result.pid;
         pushLog(name, `[traceflow] attached to pid ${result.pid}`);
         if (spec.sticky) {
@@ -641,6 +967,39 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
     }
   }
 
+  // Attach to every Node process under the matched command: the worker itself, not yarn or the watcher.
+  async function attachProcess(spec, runtime, options) {
+    const found = locateService(spec);
+    if (!found) return { ok: false, error: `No running process matches "${processMatch(spec).join(' ')}"` };
+    if (runtime.owner !== 'traceflow') {
+      runtime.status = 'running';
+      runtime.pid = found.root;
+      runtime.owner = 'terminal';
+      runtime.targets = found.targets;
+      if (found.cwd) runtime.repo = repositoryName(found.cwd) || runtime.repo;
+    }
+    if (!found.targets.length) return { ok: false, error: NO_NODE_PROCESS };
+    const pids = [];
+    const failures = [];
+    for (const pid of found.targets) {
+      try {
+        const result = await attachToPid({ ...options, pid });
+        if (result.ok) pids.push(pid);
+        else failures.push(`pid ${pid}: ${result.error}`);
+      } catch (err) {
+        failures.push(`pid ${pid}: ${err.message}`);
+      }
+    }
+    if (!pids.length) return { ok: false, error: failures[0] || 'Could not attach to the process' };
+    return {
+      ok: true,
+      pid: found.root,
+      pids,
+      targets: found.targets,
+      warning: failures.length ? `Attached ${pids.length} of ${found.targets.length} processes. ${failures[0]}` : '',
+    };
+  }
+
   async function waitForFreshAgent(name, previousHello, timeoutMs = 3000) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
@@ -651,15 +1010,14 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
   }
 
   function clearStickyMessage(runtime) {
-    if (runtime.message !== DIFFERENT_PROJECT && runtime.message !== NOT_NODE) return false;
+    if (runtime.message !== DIFFERENT_PROJECT && runtime.message !== NOT_NODE && runtime.message !== NO_NODE_PROCESS) return false;
     runtime.message = '';
     return true;
   }
 
   function scheduleReattach(name) {
-    if (closed || reattaching.has(name)) return;
-    reattaching.add(name);
-    void attachService(name).finally(() => reattaching.delete(name));
+    if (closed || attachesInFlight.has(name)) return;
+    void attachService(name);
   }
 
   function stickyDirectory(service) {
@@ -686,7 +1044,8 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
   }
 
   function scanListeners() {
-    const result = listeners();
+    const table = processTable();
+    const result = listeners({ table, cwdOf: cachedCwds(table) });
     if (!result.ok) return { ok: false, error: 'Could not inspect local listening ports' };
     const configuredPorts = new Set(activeConfig.services.map((service) => Number(service.port)));
     const next = result.listeners
@@ -695,10 +1054,71 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
         ...listener,
         attachable: true,
       }));
-    const changed = discoverySignature(discovered) !== discoverySignature(next);
+    const groups = table ? scanProcesses(table, result.listeners) : [];
+    const changed = discoverySignature(discovered) !== discoverySignature(next)
+      || processSignature(discoveredProcesses) !== processSignature(groups);
     discovered = next;
+    discoveredProcesses = groups;
     if (changed) noteServices();
-    return { ok: true, listeners: discovered };
+    return { ok: true, listeners: discovered, processes: discoveredProcesses.map(discoveredProcessView) };
+  }
+
+  // Node process trees without a port, minus anything Traceflow already tracks or started.
+  function scanProcesses(table, allListeners) {
+    const exclude = ownedPids(table);
+    for (const service of activeConfig.services) {
+      if (!isProcessService(service)) continue;
+      const runtime = runtimes.get(service.name);
+      const rootPid = runtime?.pid || locateService(service, table)?.root;
+      if (rootPid) for (const pid of subtree(table, rootPid)) exclude.add(pid);
+    }
+    return processGroups(table, {
+      listenerPids: new Set(allListeners.map((listener) => listener.pid)),
+      exclude,
+      cwdOf: cachedCwds(table),
+    });
+  }
+
+  function processSignature(groups) {
+    return groups.map((group) => [group.pid, group.command, group.workingDirectory || '', targetKey(group.targets)].join('\0')).join('\n');
+  }
+
+  async function attachDiscoveredProcess(pid) {
+    const value = Number(pid);
+    if (!Number.isInteger(value) || value < 2) return { ok: false, error: 'A valid pid is required' };
+    const scan = scanListeners();
+    if (!scan.ok) return scan;
+    const group = discoveredProcesses.find((item) => item.pid === value);
+    if (!group) return { ok: false, error: `No unattached Node.js process tree has root pid ${value}` };
+    const service = {
+      name: uniqueServiceName(processServiceName(group)),
+      command: group.command,
+      cwd: group.workingDirectory || '',
+      match: group.match,
+      repo: group.repo,
+      discovered: true,
+    };
+    activeConfig.services.push(service);
+    runtimes.set(service.name, newRuntime({
+      status: 'running',
+      pid: group.pid,
+      owner: 'terminal',
+      targets: group.targets,
+      message: 'Connecting to existing process…',
+      repo: group.repo,
+    }));
+    discoveredProcesses = discoveredProcesses.filter((item) => item.pid !== value);
+    saveRememberedServices(activeConfig);
+    noteServices();
+    return attachService(service.name, { remember: true });
+  }
+
+  function uniqueServiceName(base) {
+    const names = new Set(activeConfig.services.map((service) => service.name));
+    if (!names.has(base)) return base;
+    for (let index = 2; ; index += 1) {
+      if (!names.has(`${base}-${index}`)) return `${base}-${index}`;
+    }
   }
 
   async function attachDiscovered(port) {
@@ -719,9 +1139,9 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
       discovered: true,
     };
     activeConfig.services.push(service);
-    runtimes.set(service.name, {
-      status: 'running', pid: listener.pid, exitCode: null, child: null, owner: 'terminal', attachedPid: null, message: 'Connecting to existing process…', problem: '', repo: listener.repo,
-    });
+    runtimes.set(service.name, newRuntime({
+      status: 'running', pid: listener.pid, owner: 'terminal', message: 'Connecting to existing process…', repo: listener.repo,
+    }));
     discovered = discovered.filter((item) => item.port !== value);
     saveRememberedServices(activeConfig);
     noteServices();
@@ -729,17 +1149,30 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
   }
 
   async function refreshListeners() {
-    const scanned = listenersByPort(activeConfig.services.map((service) => service.port));
+    const portServices = activeConfig.services.filter(hasPort);
+    const hasProcessServices = portServices.length < activeConfig.services.length;
+    const table = hasProcessServices ? processTable() : null;
+    const scanned = portServices.length
+      ? listenersByPort(portServices.map((service) => service.port), { table, cwdOf: cachedCwds(table) })
+      : { ok: true, byPort: new Map() };
     if (!scanned.ok) {
       listenerDelay = Math.min(Math.max(listenerDelay, 3000) * 2, 30_000);
       return;
     }
-    listenerDelay = 3000;
+    // A failed ps only pauses process services; port services keep refreshing.
+    listenerDelay = hasProcessServices && !table ? Math.min(Math.max(listenerDelay, 3000) * 2, 30_000) : 3000;
     let changed = false;
     for (const service of activeConfig.services) {
       const runtime = runtimes.get(service.name);
-      if (runtime.owner === 'traceflow' && runtime.child && runtime.status === 'running') continue;
+      if (runtime.owner === 'traceflow' && runtime.child && runtime.status === 'running') {
+        if (isProcessService(service) && table && updateTargets(runtime, processTargets(table, runtime.child.pid))) changed = true;
+        continue;
+      }
       if (runtime.status === 'stopping') continue;
+      if (isProcessService(service)) {
+        if (table && refreshProcessService(service, runtime, locateService(service, table))) changed = true;
+        continue;
+      }
       const listener = scanned.byPort.get(Number(service.port)) || null;
       if (listener) {
         if (runtime.repo !== listener.repo) {
@@ -784,6 +1217,52 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
     if (changed) noteServices();
   }
 
+  // Track a process service started outside Traceflow. A new set of Node pids (a nodemon or tsx
+  // restart) counts as a restart, so a sticky service is attached again, like a new listener pid.
+  function refreshProcessService(service, runtime, found) {
+    let changed = false;
+    if (!found) {
+      if (runtime.owner !== 'terminal') return false;
+      markStopped(runtime);
+      return true;
+    }
+    const repo = found.cwd ? repositoryName(found.cwd) : null;
+    if (repo && runtime.repo !== repo) {
+      runtime.repo = repo;
+      changed = true;
+    }
+    if (runtime.status !== 'running' || runtime.pid !== found.root || runtime.owner !== 'terminal') {
+      runtime.status = 'running';
+      runtime.pid = found.root;
+      runtime.owner = 'terminal';
+      runtime.child = null;
+      runtime.problem = '';
+      changed = true;
+    }
+    const key = targetKey(found.targets);
+    if (updateTargets(runtime, found.targets)) changed = true;
+    if (!control.autoReattach || !service.sticky) {
+      if (clearStickyMessage(runtime)) changed = true;
+    } else if (runtime.attachedTargets !== key) {
+      if (!found.targets.length) {
+        if (runtime.message !== NO_NODE_PROCESS) {
+          runtime.message = NO_NODE_PROCESS;
+          changed = true;
+        }
+      } else {
+        if (clearStickyMessage(runtime)) changed = true;
+        scheduleReattach(service.name);
+      }
+    }
+    return changed;
+  }
+
+  function updateTargets(runtime, targets) {
+    if (targetKey(runtime.targets) === targetKey(targets)) return false;
+    runtime.targets = targets;
+    return true;
+  }
+
   function scheduleListeners() {
     if (closed) return;
     listenerTimer = setTimeout(() => {
@@ -810,6 +1289,10 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
       return false;
     }
     if (event.type === 'log' && event.service && typeof event.line === 'string') {
+      const text = logText(event.line);
+      const piped = runtimes.get(event.service)?.owner === 'traceflow';
+      if (piped && takeLine(event.service, 'pipe', text)) return false;
+      if (piped) rememberLine(event.service, 'agent', text);
       pushLog(event.service, event.line, {
         at: typeof event.at === 'number' ? event.at : undefined,
         traceId: event.traceId,
@@ -874,6 +1357,26 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
         return;
       }
       if (req.method === 'GET' && url.pathname === '/api/control') return json(res, control);
+      if (req.method === 'GET' && url.pathname === '/api/preflight') {
+        const name = url.searchParams.get('service');
+        const stack = url.searchParams.get('stack');
+        if (stack && name) return json(res, { error: 'Choose a service or a stack' }, 400);
+        if (stack) {
+          const members = activeConfig.stacks?.[stack];
+          if (!Array.isArray(members) || !members.length) return json(res, { error: 'Unknown or empty stack' }, 404);
+          const services = await Promise.all(members.map(member => servicePreflight(member, { requireRunning: true })));
+          return json(res, { stack, ok: services.every(service => service.ok), status: healthStatus(services.flatMap(service => service.checks)), services });
+        }
+        return json(res, { services: await Promise.all(activeConfig.services.filter(service => !name || service.name === name).map(service => servicePreflight(service.name))) });
+      }
+      if (req.method === 'GET' && url.pathname === '/api/stacks') {
+        return json(res, { stacks: Object.entries(activeConfig.stacks || {}).map(([name, services]) => ({ name, services, owned: [...(stackRuns.get(name)?.keys() || [])] })) });
+      }
+      const stackMatch = url.pathname.match(/^\/api\/stacks\/([^/]+)\/(start|stop)$/);
+      if (req.method === 'POST' && stackMatch) {
+        const result = await stackAction(decodeURIComponent(stackMatch[1]), stackMatch[2]);
+        return json(res, result, result.ok ? 200 : 409);
+      }
       if (req.method === 'GET' && url.pathname === '/api/state') return json(res, snapshot());
       if (req.method === 'POST' && url.pathname === '/ingest') {
         const event = await readJson(req);
@@ -960,7 +1463,9 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
       }
       if (req.method === 'POST' && url.pathname === '/api/discovery/attach') {
         const body = await readJson(req);
-        const result = await attachDiscovered(body.port);
+        const result = body.pid !== undefined && body.port === undefined
+          ? await attachDiscoveredProcess(body.pid)
+          : await attachDiscovered(body.port);
         return json(res, result, result.ok === false ? 409 : 200);
       }
       const serviceMatch = url.pathname.match(/^\/api\/services\/([^/]+)\/(start|stop|attach)$/);
@@ -1015,6 +1520,8 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
     token: sessionToken,
     close,
     startService,
+    servicePreflight,
+    stackAction,
     stopService,
     scanListeners,
     config: activeConfig,
@@ -1126,6 +1633,58 @@ function redactText(value) {
     .replace(/(bearer\s+)[a-z0-9._~+/-]+=*/gi, '$1[redacted]');
 }
 
+/** A service is found by its port when it has one, otherwise by its running command (a process service). */
+function hasPort(service) {
+  if (service?.port === undefined || service?.port === null || service?.port === '') return false;
+  const port = Number(service.port);
+  return Number.isInteger(port) && port > 0 && port <= 65535;
+}
+
+function isProcessService(service) {
+  return !hasPort(service);
+}
+
+/** Tokens identifying a process service's running command: `match` when configured, else derived from `command`. */
+function processMatch(service) {
+  if (Array.isArray(service.match)) {
+    const tokens = service.match.map((token) => String(token).trim()).filter(Boolean);
+    if (tokens.length) return tokens;
+  }
+  if (typeof service.match === 'string' && service.match.trim()) return [service.match.trim()];
+  return matchTokens(service.command || (Array.isArray(service.args) ? `node ${service.args.join(' ')}` : ''));
+}
+
+function processIdentity(service, baseDir) {
+  return [canonicalDirectory(path.resolve(baseDir || root, service.cwd || '.')), ...processMatch(service)].join('\0');
+}
+
+function targetKey(pids) {
+  return (pids || []).join(',');
+}
+
+function processServiceName(group) {
+  const words = (group.match?.length ? group.match : [group.command]).map((token) => path.basename(String(token)));
+  return words.join('-').replace(/[^\w:@.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'process';
+}
+
+function groupAlive(pgid) {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (err) {
+    return err?.code === 'EPERM';
+  }
+}
+
+async function waitUntil(check, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (check()) return true;
+    await sleep(100);
+  }
+  return check();
+}
+
 function canonicalDirectory(directory) {
   const resolved = path.resolve(directory);
   try { return fs.realpathSync(resolved); } catch { return resolved; }
@@ -1147,9 +1706,32 @@ export function restoreRememberedServices(config) {
   }
   config.autoReattach = parsed.autoReattach !== false;
   if (!Array.isArray(config.services)) config.services = [];
-  const ports = new Set(config.services.map((service) => Number(service.port)));
+  const ports = new Set(config.services.filter(hasPort).map((service) => Number(service.port)));
   const names = new Set(config.services.map((service) => service.name));
+  const processes = new Set(config.services.filter(isProcessService).map((service) => processIdentity(service, config.baseDir)));
   for (const service of parsed.services || []) {
+    if (service?.kind === 'process') {
+      const name = String(service.name || '');
+      const match = Array.isArray(service.match) ? service.match.map(String).filter(Boolean) : [];
+      if (!name || names.has(name) || (!match.length && !service.command)) continue;
+      const restored = {
+        name,
+        kind: 'process',
+        command: service.command ? String(service.command) : '',
+        cwd: service.cwd ? String(service.cwd) : '',
+        match,
+        repo: service.repo || null,
+        discovered: true,
+        sticky: service.sticky !== false,
+      };
+      // A configured service for the same command and directory takes precedence.
+      const identity = processIdentity(restored, config.baseDir);
+      if (processes.has(identity)) continue;
+      names.add(name);
+      processes.add(identity);
+      config.services.push(restored);
+      continue;
+    }
     const port = Number(service?.port);
     const name = String(service?.name || `localhost-${port}`);
     if (!Number.isInteger(port) || port < 1 || port > 65535 || ports.has(port) || names.has(name)) continue;
@@ -1195,7 +1777,16 @@ function rememberLaunch(service, pid) {
 export function saveRememberedServices(config) {
   const file = rememberedServicesFile(config);
   if (!file) return;
-  const services = (config.services || []).filter((service) => service.discovered).map((service) => ({
+  const services = (config.services || []).filter((service) => service.discovered).map((service) => (isProcessService(service) ? {
+    name: service.name,
+    kind: 'process',
+    command: service.command || '',
+    cwd: service.cwd || '',
+    match: processMatch(service),
+    repo: service.repo || null,
+    discovered: true,
+    sticky: Boolean(service.sticky),
+  } : {
     name: service.name,
     port: service.port,
     command: service.command || '',
@@ -1295,6 +1886,10 @@ function preferName(current, next) {
   if (!current) return next;
   if (String(current).startsWith('proxy:') && !String(next).startsWith('proxy:')) return next;
   return current;
+}
+
+function logText(line) {
+  return stripAnsi(redactText(String(line))).trimEnd();
 }
 
 function stripAnsi(value) {

@@ -11,6 +11,7 @@
     "/sockjs-node"
   ],
   "include": [],
+  "stacks": { "app": ["web-app", "api-service"] },
   "services": [
     {
       "name": "web-app",
@@ -25,6 +26,11 @@
       "command": "npm run dev",
       "port": 8080,
       "color": "#7ee0c6"
+    },
+    {
+      "name": "queues",
+      "cwd": "../api-service",
+      "command": "yarn dev:queues"
     }
   ]
 }

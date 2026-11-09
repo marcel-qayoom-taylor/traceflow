@@ -6,6 +6,14 @@ This project follows Semantic Versioning.
 
 ## Unreleased
 
+- Add process services for Node programs without a port, such as queue workers. Configure one without a `port`, or attach one from **Scan**. Traceflow can start and stop it, show its logs, and trace its outbound calls. It reattaches after a restart, including when a watcher such as `nodemon` or `tsx` restarts the worker.
+- Report each service's kind in MCP diagnostics.
+- Show each log line from a service Traceflow started once instead of twice, and redact secrets in its piped output too.
+- Show why a service is not attached on its card instead of only in the status tooltip, and explain when the Node inspector port is taken.
+- Never run two attaches to one service at once.
+- Keep spaces in wrapped participant names on the diagram.
+- Scan in about a third of the time by reading every process in one `ps` call.
+
 ## 0.1.6 - 2026-09-29
 
 - Reattach a service after it restarts when it is the same project you already attached. Auto-reattach is on by default and can be turned off in Settings.

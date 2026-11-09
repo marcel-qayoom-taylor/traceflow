@@ -5,7 +5,17 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { workingDirectoryForCommand } from './attach.mjs';
+import {
+  commandMatches,
+  friendlyCommand,
+  locateProcess,
+  matchTokens,
+  parseProcessTable,
+  pidAlive,
+  processGroups,
+  processTargets,
+  workingDirectoryForCommand,
+} from './attach.mjs';
 import { loadConfig, nodeBinForProject, startServer } from './server.mjs';
 
 const ignore = ['/health', '/healthcheck', '/ready', '/metrics', '/favicon.ico'];
@@ -14,6 +24,28 @@ test('configuration is optional when discovering local services', () => {
   const config = loadConfig({ cwd: '/traceflow/no-config-here', env: {} });
   assert.equal(config.port, 9477);
   assert.deepEqual(config.services, []);
+});
+
+test('a remembered process service is not restored next to the same configured one', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'traceflow-process-memory-'));
+  fs.writeFileSync(path.join(directory, 'traceflow.services.json'), JSON.stringify({
+    services: [
+      { name: 'dev:queues', kind: 'process', command: 'yarn dev:queues', cwd: directory, match: ['dev:queues'], discovered: true, sticky: true },
+      { name: 'dev:mailer', kind: 'process', command: 'yarn dev:mailer', cwd: directory, match: ['dev:mailer'], discovered: true, sticky: true },
+    ],
+  }));
+  const app = await startServer({
+    port: 0,
+    config: { baseDir: directory, include: [], ignore, services: [{ name: 'queues', command: 'yarn dev:queues' }] },
+  });
+  try {
+    const state = await api(app, '/api/state');
+    assert.deepEqual(state.services.map((service) => service.name).sort(), ['dev:mailer', 'queues']);
+    assert.equal(state.services.every((service) => service.kind === 'process' && service.port === null), true);
+  } finally {
+    await app.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('attached services are restored from the local memory file', async () => {
@@ -944,6 +976,353 @@ test('large bodies stay intact while traces keep 48KB', async () => {
   }
 });
 
+test('process commands reduce to the tokens a running process must contain', () => {
+  assert.deepEqual(matchTokens('yarn dev:queues'), ['dev:queues']);
+  assert.deepEqual(matchTokens('npm run dev:queues -- --verbose'), ['dev:queues']);
+  assert.deepEqual(matchTokens('NODE_ENV=dev node --inspect dist/worker.js'), ['dist/worker.js']);
+  assert.deepEqual(matchTokens('yarn workspace @app/services dev:queues'), ['workspace', '@app/services', 'dev:queues']);
+  assert.deepEqual(matchTokens('node -e "setInterval(() => {}, 1000)"'), ['setInterval(() => {}, 1000)']);
+  assert.deepEqual(matchTokens('nodemon'), ['nodemon']);
+
+  assert.equal(commandMatches('node /opt/homebrew/bin/yarn dev:queues', ['dev:queues']), true);
+  assert.equal(commandMatches('npm run dev:queues', ['dev:queues']), true);
+  assert.equal(commandMatches('node /repo/dist/worker.js', ['dist/worker.js']), true);
+  assert.equal(commandMatches('node ./dist/worker.js', ['./dist/worker.js']), true);
+  assert.equal(commandMatches('node -e setInterval(() => {}, 1000)', ['setInterval(() => {}, 1000)']), true);
+  assert.equal(commandMatches('node /opt/homebrew/bin/yarn dev', ['dev:queues']), false);
+  assert.equal(commandMatches('node /repo/dist/other-worker.js', ['worker.js']), false);
+  assert.equal(commandMatches('anything', []), false);
+
+  assert.equal(friendlyCommand('node /opt/homebrew/bin/yarn dev:queues'), 'yarn dev:queues');
+  assert.equal(friendlyCommand('/x/bin/node /x/lib/node_modules/npm/bin/npm-cli.js run dev'), 'npm run dev');
+  assert.equal(friendlyCommand('/x/bin/node --inspect-port=0 worker.js'), 'node --inspect-port=0 worker.js');
+  assert.equal(friendlyCommand('npm run dev:queues'), 'npm run dev:queues');
+});
+
+test('a process service resolves to its topmost tree and the Node processes running user code', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'traceflow-locate-'));
+  const other = fs.mkdtempSync(path.join(os.tmpdir(), 'traceflow-locate-other-'));
+  fs.mkdirSync(path.join(repo, '.git'));
+  fs.mkdirSync(path.join(repo, 'packages', 'queues'), { recursive: true });
+  const real = fs.realpathSync(repo);
+  try {
+    const table = parseProcessTable([
+      '900100     1 900100 -zsh',
+      '900101 900100 900101 node /opt/homebrew/bin/yarn dev:queues',
+      '900102 900101 900101 /bin/sh -c tsx watch src/queues.ts',
+      '900103 900102 900101 node /repo/node_modules/.bin/tsx watch src/queues.ts',
+      '900104 900103 900101 /usr/local/bin/node --require /repo/node_modules/tsx/preflight.cjs src/queues.ts',
+      '900105 900104 900101 /usr/local/bin/node /repo/node_modules/bull/lib/process/master.js',
+      '900200 900100 900200 node /opt/homebrew/bin/yarn dev:queues',
+      '900050 900100 900050 vim dev:queues',
+      '900060 900100 900060 tail -f dev:queues',
+      '900300 900100 900300 node /repo/node_modules/concurrently/dist/bin/concurrently.js yarn dev:queues yarn dev:api',
+      '900301 900300 900300 node /opt/homebrew/bin/yarn dev:queues',
+      '900302 900301 900300 /usr/local/bin/node dist/queues.js',
+    ].join('\n'));
+    const cwds = new Map([[900050, real], [900060, real], [900101, real], [900200, other], [900300, other], [900301, other]]);
+    const cwdOf = (pids) => new Map(pids.map((pid) => [pid, cwds.get(pid)]));
+
+    assert.deepEqual(processTargets(table, 900101), [900104, 900105]);
+    assert.deepEqual(processTargets(table, 900200), [], 'a launcher without a worker is not a running worker');
+    const found = locateProcess(table, { tokens: ['dev:queues'], cwd: repo }, { cwdOf });
+    assert.equal(found.root, 900101);
+    assert.deepEqual(found.pids.sort(), [900101, 900102, 900103, 900104, 900105]);
+    assert.deepEqual(found.targets, [900104, 900105]);
+
+    const fromPackage = locateProcess(table, { tokens: ['dev:queues'], cwd: path.join(repo, 'packages', 'queues') }, { cwdOf });
+    assert.equal(fromPackage?.root, 900101, 'a workspace script started from the repository root still matches');
+    const underRunner = locateProcess(table, { tokens: ['dev:queues'], cwd: other }, { cwdOf });
+    assert.equal(underRunner?.root, 900200, 'the lowest matching pid wins, never the concurrently runner');
+    assert.equal(locateProcess(table, { tokens: ['dev:queues'], cwd: other }, { cwdOf, exclude: new Set([900200]) })?.root, 900301);
+    assert.equal(locateProcess(table, { tokens: ['dev:queues'], cwd: repo }, { cwdOf, exclude: new Set([900101]) }), null);
+    assert.equal(locateProcess(table, { tokens: ['dev:api'] }, { cwdOf }), null);
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+    fs.rmSync(other, { recursive: true, force: true });
+  }
+});
+
+test('process discovery lists terminal-started Node trees without a port inside a repository', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'traceflow-groups-'));
+  const loose = fs.mkdtempSync(path.join(os.tmpdir(), 'traceflow-groups-loose-'));
+  fs.mkdirSync(path.join(repo, '.git'));
+  try {
+    const table = parseProcessTable([
+      '910000     1 910000 -zsh',
+      '910001 910000 910001 node /opt/homebrew/bin/yarn dev:queues',
+      '910002 910001 910001 /usr/local/bin/node dist/queues.js',
+      '910010 910000 910010 node /opt/homebrew/bin/yarn dev:api',
+      '910011 910010 910010 /usr/local/bin/node dist/api.js',
+      '910020 910000 910020 claude',
+      '910021 910020 910020 node /usr/lib/traceflow/src/mcp/server.mjs',
+      '910030 910000 910030 node /repo/node_modules/typescript/bin/tsc -w',
+      '910040 910000 910040 node scratch.js',
+      '910050     1 910050 /Applications/Code Helper (Plugin) --type=utility',
+      '910051 910050 910050 /usr/local/bin/node /ext/tsserver.js',
+      '910060 910000 910060 node /repo/node_modules/concurrently/dist/bin/concurrently.js yarn:one yarn:two',
+      '910061 910060 910060 node /opt/homebrew/bin/yarn one',
+      '910062 910061 910060 /usr/local/bin/node one.js',
+    ].join('\n'));
+    const cwdOf = (pids) => new Map(pids.map((pid) => [pid, pid === 910040 ? loose : repo]));
+    const groups = processGroups(table, { listenerPids: new Set([910011]), cwdOf });
+    assert.deepEqual(groups.map((group) => group.pid), [910001, 910061]);
+    const queues = groups[0];
+    assert.equal(queues.command, 'yarn dev:queues');
+    assert.deepEqual(queues.match, ['dev:queues']);
+    assert.deepEqual(queues.targets, [910002]);
+    assert.equal(queues.repo, path.basename(repo));
+    assert.deepEqual(processGroups(table, { exclude: new Set([910002]), cwdOf }).map((group) => group.pid), [910010, 910061]);
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+    fs.rmSync(loose, { recursive: true, force: true });
+  }
+});
+
+test('a process service started by Traceflow streams logs and traces outbound calls without a port', async () => {
+  const directory = processProject();
+  const target = await jobTarget();
+  const app = await startServer({
+    port: 0,
+    config: {
+      baseDir: directory,
+      include: [],
+      ignore,
+      services: [{ name: 'owned-queue', cwd: directory, command: 'node worker.js', env: { TARGET_PORT: String(target.port) } }],
+    },
+  });
+  try {
+    const initial = (await api(app, '/api/state')).services[0];
+    assert.equal(initial.kind, 'process');
+    assert.equal(initial.port, null);
+    assert.deepEqual(initial.match, ['worker.js']);
+    assert.equal(initial.status, 'stopped');
+
+    const started = await app.startService('owned-queue');
+    assert.equal(started.ok, true, started.error);
+    const running = await waitFor(async () => {
+      const service = (await api(app, '/api/state')).services[0];
+      return service.status === 'running' && service.agent ? service : null;
+    }, 8000);
+    assert.equal(running.owner, 'traceflow');
+    const log = await waitFor(async () => (await api(app, '/api/state')).logEntries.find((entry) => entry.service === 'owned-queue' && entry.line.includes('worker started')) || null);
+    assert.match(log.line, /port=unset/);
+    await waitFor(async () => (await api(app, '/api/state')).logEntries.filter((entry) => entry.line.startsWith('job done')).length >= 3, 8000);
+    await sleep(500);
+    const lines = (await api(app, '/api/state')).logEntries.filter((entry) => entry.service === 'owned-queue').map((entry) => entry.line);
+    assert.equal(lines.filter((line) => line.includes('worker started')).length, 1, 'piped and agent copies of a line are shown once');
+    const jobs = lines.filter((line) => line.startsWith('job done'));
+    assert.equal(new Set(jobs).size, jobs.length, 'each numbered job line appears once');
+    const trace = await waitFor(async () => (await api(app, '/api/state')).traces.find((item) => item.spans.some((span) => span.from === 'owned-queue' && span.path === '/job' && span.status === 200)) || null, 8000);
+    assert.equal(trace.spans[0].to, `127.0.0.1:${target.port}`);
+
+    const stopped = await app.stopService('owned-queue');
+    assert.equal(stopped.ok, true, stopped.error);
+    assert.equal(pidAlive(running.pid), false);
+    const after = (await api(app, '/api/state')).services[0];
+    assert.equal(after.status, 'stopped');
+    assert.equal(after.problem, '');
+  } finally {
+    await app.close();
+    target.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a terminal process service is attached, reattached after a watcher restart, and stopped', async () => {
+  const directory = processProject();
+  const target = await jobTarget();
+  const app = await startServer({
+    port: 0,
+    config: {
+      baseDir: directory,
+      include: [],
+      ignore,
+      services: [{ name: 'queues', cwd: directory, command: 'node nodemon.js worker.js' }],
+    },
+  });
+  const shell = spawnTerminal('node --inspect-port=0 nodemon.js worker.js', directory, { TARGET_PORT: String(target.port) });
+  try {
+    const running = await waitFor(async () => {
+      const service = (await api(app, '/api/state')).services[0];
+      return service.status === 'running' && service.processes === 1 ? service : null;
+    }, 8000);
+    assert.equal(running.owner, 'terminal');
+    assert.equal(running.agent, false);
+    assert.equal(running.attached, false);
+
+    const blocked = await app.startService('queues');
+    assert.equal(blocked.ok, false);
+    assert.match(blocked.error, /Already running/);
+
+    const attached = await api(app, '/api/services/queues/attach', { method: 'POST', body: {} });
+    assert.equal(attached.ok, true, attached.error);
+    assert.equal(attached.pids.length, 1, 'only the worker is attached, not the watcher');
+    await waitFor(async () => (await api(app, '/api/state')).traces.find((item) => item.spans.some((span) => span.from === 'queues' && span.path === '/job')) || null, 8000);
+    await waitFor(async () => (await api(app, '/api/state')).logEntries.find((entry) => entry.service === 'queues' && entry.line.includes('job done 200')) || null, 8000);
+    const saved = JSON.parse(fs.readFileSync(path.join(directory, 'traceflow.services.json'), 'utf8'));
+    assert.equal(saved.sticky.some((item) => item.name === 'queues'), true);
+
+    const firstWorker = attached.pids[0];
+    const killedAt = Date.now();
+    process.kill(firstWorker, 'SIGKILL');
+    const restarted = await waitFor(async () => {
+      const snapshot = await api(app, '/api/state');
+      const service = snapshot.services[0];
+      const fresh = snapshot.logEntries.some((entry) => entry.service === 'queues' && entry.line.includes('job done') && entry.at > killedAt + 200);
+      return service.pid === running.pid && service.attached && fresh ? service : null;
+    }, 15000);
+    assert.equal(restarted.status, 'running');
+    assert.equal(restarted.processes, 1);
+
+    const stopped = await api(app, '/api/services/queues/stop', { method: 'POST', body: {} });
+    assert.equal(stopped.ok, true, stopped.error);
+    assert.equal(pidAlive(running.pid), false);
+    const after = (await api(app, '/api/state')).services[0];
+    assert.equal(after.status, 'stopped');
+    assert.equal(after.processes, 0);
+  } finally {
+    try { process.kill(-shell.pid, 'SIGKILL'); } catch { /* already stopped */ }
+    await app.close();
+    target.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('scan lists a Node process without a port and remembers it once attached', async () => {
+  const directory = processProject({ git: true });
+  const target = await jobTarget();
+  const config = () => ({ baseDir: directory, include: [], ignore, services: [] });
+  let app = await startServer({ port: 0, config: config() });
+  const shell = spawnTerminal('node --inspect-port=0 worker.js', directory, { TARGET_PORT: String(target.port) });
+  try {
+    const realDirectory = fs.realpathSync(directory);
+    const group = await waitFor(async () => {
+      const scan = await api(app, '/api/discovery/scan', { method: 'POST', body: {} });
+      return scan.processes.find((item) => item.workingDirectory === realDirectory) || null;
+    }, 8000);
+    assert.equal(group.command, 'node --inspect-port=0 worker.js');
+    assert.deepEqual(group.match, ['worker.js']);
+    assert.equal(group.repo, path.basename(directory));
+
+    const attached = await api(app, '/api/discovery/attach', { method: 'POST', body: { pid: group.pid } });
+    assert.equal(attached.ok, true, attached.error);
+    const service = await waitFor(async () => (await api(app, '/api/state')).services.find((item) => item.kind === 'process' && item.agent) || null, 8000);
+    assert.equal(service.name, 'worker.js');
+    assert.equal(service.discovered, true);
+    const rescan = await api(app, '/api/discovery/scan', { method: 'POST', body: {} });
+    assert.equal(rescan.processes.some((item) => item.pid === group.pid), false, 'an attached process leaves the scan list');
+    const saved = JSON.parse(fs.readFileSync(path.join(directory, 'traceflow.services.json'), 'utf8'));
+    const remembered = saved.services.find((item) => item.name === 'worker.js');
+    assert.equal(remembered.kind, 'process');
+    assert.equal(remembered.port, undefined);
+    assert.deepEqual(remembered.match, ['worker.js']);
+    assert.equal(remembered.sticky, true);
+
+    await app.close();
+    app = await startServer({ port: 0, config: config() });
+    const restored = await waitFor(async () => {
+      const item = (await api(app, '/api/state')).services.find((entry) => entry.name === 'worker.js');
+      return item?.status === 'running' && item.attached && item.agent ? item : null;
+    }, 15000);
+    assert.equal(restored.kind, 'process');
+  } finally {
+    try { process.kill(-shell.pid, 'SIGKILL'); } catch { /* already stopped */ }
+    await app.close();
+    target.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('a configured process service only matches its own working directory', async () => {
+  const project = processProject();
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 'traceflow-elsewhere-'));
+  const target = await jobTarget();
+  const shell = spawnTerminal('node --inspect-port=0 worker.js', project, { TARGET_PORT: String(target.port) });
+  try {
+    await waitFor(() => fs.existsSync(project), 1000);
+    await sleep(500);
+    const app = await startServer({
+      port: 0,
+      config: {
+        baseDir: elsewhere,
+        include: [],
+        ignore,
+        services: [
+          { name: 'no-cwd', command: 'node worker.js' },
+          { name: 'with-cwd', cwd: project, command: 'node worker.js' },
+        ],
+      },
+    });
+    try {
+      const state = await waitFor(async () => {
+        const snapshot = await api(app, '/api/state');
+        return snapshot.services.find((service) => service.name === 'with-cwd')?.status === 'running' ? snapshot : null;
+      }, 8000);
+      assert.equal(state.services.find((service) => service.name === 'no-cwd').status, 'stopped');
+    } finally {
+      await app.close();
+    }
+  } finally {
+    try { process.kill(-shell.pid, 'SIGKILL'); } catch { /* already stopped */ }
+    target.close();
+    fs.rmSync(project, { recursive: true, force: true });
+    fs.rmSync(elsewhere, { recursive: true, force: true });
+  }
+});
+
+// A queue-worker-like project: worker.js calls TARGET_PORT on a timer and never listens; nodemon.js
+// restarts it when it exits, like the real watcher.
+function processProject({ git = false } = {}) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'traceflow-process-'));
+  if (git) fs.mkdirSync(path.join(directory, '.git'));
+  fs.writeFileSync(path.join(directory, 'worker.js'), `
+    const http = require('http');
+    console.log('worker started port=' + (process.env.PORT || 'unset'));
+    let jobs = 0;
+    setInterval(() => {
+      const job = ++jobs;
+      const req = http.get({ host: '127.0.0.1', port: Number(process.env.TARGET_PORT), path: '/job' }, (res) => {
+        res.resume();
+        res.on('end', () => console.log('job done ' + res.statusCode + ' #' + job));
+      });
+      req.on('error', () => {});
+    }, 200);
+  `);
+  fs.writeFileSync(path.join(directory, 'nodemon.js'), `
+    const { spawn } = require('child_process');
+    let stopping = false;
+    process.on('SIGTERM', () => { stopping = true; process.exit(0); });
+    const run = () => {
+      const child = spawn(process.execPath, ['--inspect-port=0', process.argv[2]], { stdio: 'inherit' });
+      child.on('exit', () => { if (!stopping) setTimeout(run, 100); });
+    };
+    run();
+  `);
+  return directory;
+}
+
+function jobTarget() {
+  return new Promise((resolve) => {
+    const server = http.createServer((req, res) => res.end('ok'));
+    server.listen(0, '127.0.0.1', () => resolve({
+      port: server.address().port,
+      close: () => { server.closeAllConnections?.(); server.close(); },
+    }));
+  });
+}
+
+// Run a command the way a terminal does: a shell that stays the parent of the dev process.
+function spawnTerminal(command, cwd, extraEnv = {}) {
+  const env = { ...process.env, ...extraEnv };
+  delete env.NODE_OPTIONS;
+  delete env.PORT;
+  for (const key of Object.keys(env)) if (key.startsWith('TRACEFLOW_')) delete env[key];
+  const child = spawn('/bin/sh', ['-c', `${command}; :`], { cwd, env, detached: true, stdio: 'ignore' });
+  child.unref();
+  return child;
+}
+
 const MAX_JSON_PROBE = 4_000_001;
 
 function echoSource(port) {
@@ -1173,3 +1552,72 @@ async function waitFor(fn, ms = 4000) {
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+test('preflight reports missing keys without exposing values and blocks missing directories', async () => {
+  const { preflight } = await import('./preflight.mjs');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'traceflow-preflight-'));
+  try {
+    fs.writeFileSync(path.join(directory, '.env.example'), 'TF_TEST_PRESENT=example-secret\nTF_TEST_MISSING=hidden-default\n');
+    fs.writeFileSync(path.join(directory, '.env'), 'TF_TEST_PRESENT=private-secret\n');
+    const report = await preflight({ name: 'api' }, { baseDir: directory });
+    assert.equal(report.ok, true);
+    fs.writeFileSync(path.join(directory, '.tool-versions'), 'python 3.12.0\n');
+    assert.equal((await preflight({ name: 'api' }, { baseDir: directory })).checks.find(check => check.check === 'node').status, 'ok');
+    assert.equal((await preflight({ name: 'api', command: 'pnpm dev', env: { PATH: '/missing-tool-path' } }, { baseDir: directory })).ok, false);
+    assert.match(JSON.stringify(report), /TF_TEST_MISSING/);
+    assert.doesNotMatch(JSON.stringify(report), /private-secret|hidden-default|example-secret/);
+    assert.equal(fs.readFileSync(path.join(directory, '.env'), 'utf8'), 'TF_TEST_PRESENT=private-secret\n');
+    assert.equal((await preflight({ name: 'missing', cwd: 'missing' }, { baseDir: directory })).ok, false);
+    fs.symlinkSync('.env.example', path.join(directory, '.node-version'));
+    assert.equal((await preflight({ name: 'api' }, { baseDir: directory })).ok, false);
+  } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('health status distinguishes warnings from errors', async () => {
+  const { healthStatus } = await import('./preflight.mjs');
+  assert.equal(healthStatus([{ status: 'ok' }]), 'healthy');
+  assert.equal(healthStatus([{ status: 'ok' }, { status: 'warn' }]), 'degraded');
+  assert.equal(healthStatus([{ status: 'warn' }, { status: 'error' }]), 'unhealthy');
+  assert.equal(healthStatus([]), 'degraded');
+});
+
+test('preflight checks readiness and rejects remote redirects', async () => {
+  const { preflight } = await import('./preflight.mjs');
+  const server = http.createServer((req, res) => {
+    if (req.url === '/ready') res.writeHead(204).end();
+    else res.writeHead(302, { location: 'https://example.com' }).end();
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const options = { baseDir: os.tmpdir(), running: true, listener: {} };
+    const spec = { name: 'api', port: server.address().port, healthPath: '/ready' };
+    assert.equal((await preflight(spec, options)).ok, true);
+    assert.equal((await preflight({ ...spec, healthPath: '/redirect' }, options)).ok, false);
+    assert.equal((await preflight({ ...spec, healthPath: '//example.com' }, options)).ok, false);
+  } finally { await new Promise(resolve => server.close(resolve)); }
+});
+
+test('stack cleanup leaves independently started services alive and requires API authentication', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'traceflow-stack-'));
+  const app = await startServer({ port: 0, config: {
+    baseDir: directory,
+    services: ['independent', 'owned'].map(name => ({ name, cwd: directory, args: ['-e', 'setInterval(() => {}, 1000)'] })),
+    stacks: { task: ['independent', 'owned'] },
+  } });
+  try {
+    assert.equal((await app.stackAction('task', 'invalid')).ok, false);
+    const independent = await app.startService('independent');
+    assert.equal(independent.ok, true);
+    const response = await fetch(`${app.url}/api/stacks/task/start`, { method: 'POST' });
+    assert.equal(response.status, 403);
+    const started = await app.stackAction('task', 'start');
+    assert.equal(started.ok, true);
+    assert.equal(started.results[0].reused, true);
+    const owned = started.results[1].pid;
+    assert.ok(owned);
+    assert.equal((await app.stackAction('task', 'stop')).ok, true);
+    assert.equal(pidAlive(independent.pid), true);
+    assert.equal(pidAlive(owned), false);
+    assert.equal((await app.stackAction('missing', 'start')).ok, false);
+  } finally { await app.close(); fs.rmSync(directory, { recursive: true, force: true }); }
+});
