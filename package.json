@@ -20,6 +20,7 @@
   "files": [
     "src/agent",
     "src/attach.mjs",
+    "src/diagrams.mjs",
     "src/demo",
     "src/mcp",
     "src/public",

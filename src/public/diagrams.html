@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="traceflow-token" content="__TRACEFLOW_TOKEN__">
+  <title>Traceflow Diagrams</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/diagrams.css">
+</head>
+<body class="diagrams-page">
+  <header class="top">
+    <div class="brand">
+      <strong>Traceflow</strong>
+      <span>diagrams</span>
+    </div>
+    <nav class="view-tabs" aria-label="Views">
+      <a href="/">Traces</a>
+      <a href="/diagrams" aria-current="page">Diagrams</a>
+    </nav>
+    <div class="transport">
+      <button type="button" id="present" title="Present full screen, revealing a sequence diagram one message at a time">▶ Present</button>
+      <button type="button" id="export-toggle" class="primary" popovertarget="export-menu" aria-haspopup="menu">Export ▾</button>
+    </div>
+    <div class="settings">
+      <button type="button" id="settings-toggle" class="settings-toggle" aria-label="Settings" title="Settings" aria-expanded="false" aria-controls="settings-panel">⚙️</button>
+      <div id="settings-panel" class="settings-panel" role="dialog" aria-label="Diagram settings" hidden>
+        <div class="settings-heading">Appearance</div>
+        <label class="settings-row">
+          <span>Theme</span>
+          <select id="theme">
+            <option value="redux-color">Colour</option>
+            <option value="redux-dark-color">Colour dark</option>
+            <option value="redux">Plain</option>
+            <option value="redux-dark">Plain dark</option>
+            <option value="default">Mermaid classic</option>
+            <option value="forest">Forest</option>
+          </select>
+        </label>
+        <label class="settings-row">
+          <span>Style</span>
+          <select id="look">
+            <option value="neo">Clean</option>
+            <option value="classic">Classic</option>
+          </select>
+        </label>
+        <div class="settings-heading">Export</div>
+        <label class="settings-row">
+          <span>PNG size</span>
+          <select id="png-scale">
+            <option value="1">1×</option>
+            <option value="2">2× (sharp)</option>
+            <option value="3">3×</option>
+          </select>
+        </label>
+        <label class="settings-row"><span>Transparent background</span><input id="transparent" type="checkbox"></label>
+        <div class="settings-heading">Editor</div>
+        <label class="settings-row">
+          <span>Font size</span>
+          <select id="font-size">
+            <option value="12">12px</option>
+            <option value="13">13px</option>
+            <option value="14">14px</option>
+            <option value="16">16px</option>
+          </select>
+        </label>
+        <label class="settings-row"><span>Wrap long lines</span><input id="wrap" type="checkbox"></label>
+        <label class="settings-row"><span>Suggestions while typing</span><input id="autocomplete" type="checkbox"></label>
+        <div class="settings-heading">Trace diagrams</div>
+        <label class="settings-row"><span>Group repeated calls into loops</span><input id="collapse-repeats" type="checkbox"></label>
+        <label class="settings-row"><span>Add bodies as notes</span><input id="trace-notes" type="checkbox"></label>
+        <div class="settings-heading">Storage</div>
+        <div id="diagram-dir" class="settings-note diagram-dir"></div>
+      </div>
+    </div>
+  </header>
+  <div id="export-menu" class="menu" popover role="menu" aria-label="Export">
+    <button type="button" role="menuitem" data-export="copy-png">Copy PNG <kbd>⌘⇧C</kbd></button>
+    <button type="button" role="menuitem" data-export="copy-svg">Copy SVG</button>
+    <button type="button" role="menuitem" data-export="copy-source">Copy Mermaid source</button>
+    <hr>
+    <button type="button" role="menuitem" data-export="png">Download PNG</button>
+    <button type="button" role="menuitem" data-export="svg">Download SVG</button>
+    <button type="button" role="menuitem" data-export="mmd">Download .mmd</button>
+  </div>
+  <div id="new-menu" class="menu" popover role="menu" aria-label="New diagram">
+    <button type="button" role="menuitem" data-template="sequence">Sequence diagram</button>
+    <button type="button" role="menuitem" data-template="flowchart">Flowchart</button>
+    <button type="button" role="menuitem" data-template="blank">Blank</button>
+  </div>
+  <main class="diagrams-main">
+    <aside class="rail diagram-rail">
+      <section class="grow">
+        <div class="section-title">
+          <span>Diagrams</span>
+          <button type="button" id="new-diagram" class="text" popovertarget="new-menu" aria-haspopup="menu">New ▾</button>
+        </div>
+        <div class="trace-search">
+          <div class="trace-search-bar">
+            <input id="diagram-filter" type="search" placeholder="Filter diagrams" aria-label="Filter diagrams">
+          </div>
+        </div>
+        <div id="diagram-list" class="diagram-list"></div>
+      </section>
+      <section class="trace-picker">
+        <div class="section-title">
+          <span>From a trace</span>
+          <button type="button" id="compare-traces" class="text" title="Compare two traces side by side">Compare</button>
+        </div>
+        <div id="trace-list" class="diagram-list"></div>
+      </section>
+    </aside>
+    <section class="editor-pane">
+      <div class="editor-head">
+        <input id="diagram-name" class="diagram-name" type="text" spellcheck="false" aria-label="Diagram name" disabled>
+        <span id="save-state" class="save-state"></span>
+        <button type="button" id="delete-diagram" class="delete-button" title="Delete diagram" disabled>Delete</button>
+      </div>
+      <div class="source-wrap">
+        <pre id="source-highlight" class="source source-highlight" aria-hidden="true"></pre>
+        <textarea id="source" class="source source-input" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Mermaid source" aria-autocomplete="list" aria-controls="completions" disabled></textarea>
+        <div id="completions" class="completions" role="listbox" aria-label="Suggestions" hidden></div>
+      </div>
+      <button type="button" id="render-error" class="render-error" title="Go to the line with the error" hidden></button>
+    </section>
+    <div
+      id="editor-resizer"
+      class="editor-resizer"
+      role="separator"
+      aria-label="Resize editor"
+      aria-orientation="vertical"
+      tabindex="0"
+    ></div>
+    <section class="preview-pane">
+      <div id="preview" class="preview" aria-label="Diagram preview"></div>
+      <div class="preview-controls">
+        <button type="button" id="zoom-out" title="Zoom out">−</button>
+        <button type="button" id="zoom-fit" title="Fit to view (double-click)">Fit</button>
+        <button type="button" id="zoom-in" title="Zoom in">+</button>
+      </div>
+      <div id="toast" class="toast" role="status" hidden></div>
+    </section>
+  </main>
+  <script src="/vendor/mermaid.min.js?v=12.3.0"></script>
+  <script src="/diagrams.js"></script>
+</body>
+</html>

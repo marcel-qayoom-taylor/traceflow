@@ -1267,6 +1267,7 @@ function renderDiagram() {
   const root = $('diagram');
   const trace = shownTrace();
   root.replaceChildren();
+  renderDiagramActions(trace);
   if (!trace) {
     const empty = document.createElement('div');
     empty.className = 'empty';
@@ -1370,6 +1371,55 @@ function renderDiagram() {
     diagramView.userMoved = false;
   }
   placeDiagram(svg);
+}
+
+function renderDiagramActions(trace) {
+  const root = $('diagram-actions');
+  root.hidden = !trace?.spans?.length;
+  if (root.hidden) {
+    root.replaceChildren();
+    return;
+  }
+  if (root.dataset.traceId === trace.id && root.childElementCount) return;
+  root.dataset.traceId = trace.id;
+  const copy = button('Copy Mermaid', async () => {
+    try {
+      const { source } = await traceMermaid(shownTrace() || trace);
+      copy.textContent = (await copyText(source)) ? 'Copied' : 'Copy failed';
+    } catch (err) {
+      copy.textContent = 'Copy failed';
+      copy.title = err.message;
+    }
+    setTimeout(() => { copy.textContent = 'Copy Mermaid'; }, 1400);
+  });
+  copy.title = 'Copy this trace as a Mermaid sequence diagram';
+  const open = button('Edit as diagram →', async () => {
+    try {
+      const { name } = await traceMermaid(shownTrace() || trace, { save: true });
+      location.href = `/diagrams#${encodeURIComponent(name)}`;
+    } catch (err) {
+      open.title = err.message;
+      open.textContent = 'Could not open';
+      setTimeout(() => { open.textContent = 'Edit as diagram →'; }, 1600);
+    }
+  });
+  open.title = 'Save this trace as a Mermaid diagram and open it in Diagrams';
+  root.replaceChildren(copy, open);
+}
+
+function traceMermaid(trace, { save = false } = {}) {
+  const labels = {};
+  for (const span of trace.spans) {
+    for (const name of [span.from, span.to]) if (name && !labels[name]) labels[name] = actorLabel(name).title;
+  }
+  // Uses the trace options chosen in the diagram editor's settings.
+  const setting = (key) => { try { return localStorage.getItem(`traceflow.diagrams.v2.${key}`); } catch { return null; } };
+  return post(`/api/traces/${encodeURIComponent(trace.id)}/mermaid`, {
+    labels,
+    save,
+    collapseRepeats: setting('collapse-repeats') !== '0',
+    notes: setting('trace-notes') === '1',
+  });
 }
 
 function updateDiagramSelection() {

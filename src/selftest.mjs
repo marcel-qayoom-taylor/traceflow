@@ -17,6 +17,8 @@ import {
   workingDirectoryForCommand,
 } from './attach.mjs';
 import { loadConfig, nodeBinForProject, startServer } from './server.mjs';
+import { traceToMermaid, validDiagramName } from './diagrams.mjs';
+import readline from 'node:readline';
 
 const ignore = ['/health', '/healthcheck', '/ready', '/metrics', '/favicon.ico'];
 
@@ -1620,4 +1622,188 @@ test('stack cleanup leaves independently started services alive and requires API
     assert.equal(pidAlive(owned), false);
     assert.equal((await app.stackAction('missing', 'start')).ok, false);
   } finally { await app.close(); fs.rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('diagrams are saved, listed, renamed and deleted as .mmd files', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'traceflow-diagrams-'));
+  const app = await startServer({ port: 0, config: { include: [], ignore, services: [], diagramsDir: directory } });
+  try {
+    const page = await fetch(`${app.url}/diagrams`);
+    assert.equal(page.status, 200);
+    assert.match(page.headers.get('content-security-policy'), /style-src 'self' 'unsafe-inline'/);
+    assert.doesNotMatch(await page.text(), /__TRACEFLOW_TOKEN__/);
+    assert.equal((await fetch(`${app.url}/vendor/mermaid.min.js`)).status, 200);
+
+    const created = await api(app, '/api/diagrams', { method: 'POST', body: { name: 'Checkout flow', source: 'sequenceDiagram\n  a->>b: hi\n' } });
+    assert.equal(created.name, 'checkout-flow');
+    const second = await api(app, '/api/diagrams', { method: 'POST', body: { name: 'Checkout flow' } });
+    assert.equal(second.name, 'checkout-flow-2');
+    assert.equal(fs.readFileSync(path.join(directory, 'checkout-flow.mmd'), 'utf8'), 'sequenceDiagram\n  a->>b: hi\n');
+
+    await api(app, '/api/diagrams/checkout-flow', { method: 'PUT', body: { source: 'sequenceDiagram\n  a->>b: bye\n' } });
+    assert.equal((await api(app, '/api/diagrams/checkout-flow')).source, 'sequenceDiagram\n  a->>b: bye\n');
+
+    const clash = await fetch(`${app.url}/api/diagrams/checkout-flow/rename`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-traceflow-token': app.token },
+      body: JSON.stringify({ to: 'checkout-flow-2' }),
+    });
+    assert.equal(clash.status, 409);
+    await api(app, '/api/diagrams/checkout-flow/rename', { method: 'POST', body: { to: 'Guest checkout' } });
+    await api(app, '/api/diagrams/checkout-flow-2', { method: 'DELETE' });
+    const listed = await api(app, '/api/diagrams');
+    assert.equal(listed.dir, directory);
+    assert.deepEqual(listed.diagrams.map((item) => item.name), ['Guest checkout']);
+
+    const escape = await fetch(`${app.url}/api/diagrams/${encodeURIComponent('../secrets')}`);
+    assert.equal(escape.status, 400);
+    const unauthenticated = await fetch(`${app.url}/api/diagrams/Guest%20checkout`, { method: 'DELETE' });
+    assert.equal(unauthenticated.status, 403);
+    assert.equal(fs.existsSync(path.join(directory, 'Guest checkout.mmd')), true);
+  } finally {
+    await app.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('diagram names cannot leave the diagrams folder', () => {
+  for (const name of ['../x', 'a/b', '.hidden', 'trailing.', '', 'a\\b']) assert.equal(validDiagramName(name), false, name);
+  for (const name of ['checkout', 'Guest checkout v2', 'order_api.flow']) assert.equal(validDiagramName(name), true, name);
+});
+
+test('a captured trace becomes a nested Mermaid sequence diagram', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'traceflow-trace-diagram-'));
+  const app = await startServer({ port: 0, config: { include: [], ignore, services: [], diagramsDir: directory } });
+  try {
+    const base = Date.now() - 1000;
+    const span = (spanId, from, to, method, pathname, phase, at, extra = {}) => ({ type: 'span', traceId: 't1', spanId, from, to, method, path: pathname, phase, at: base + at, ...extra });
+    for (const event of [
+      span('s1', 'browser', 'order-api', 'POST', '/api/orders?token=abc', 'start', 1000),
+      span('s2', 'order-api', 'payment', 'POST', '/api/payments', 'start', 1010),
+      span('s2', 'order-api', 'payment', 'POST', '/api/payments', 'end', 1130, { status: 502 }),
+      span('s1', 'browser', 'order-api', 'POST', '/api/orders?token=abc', 'end', 1180, { status: 201 }),
+    ]) await api(app, '/ingest', { method: 'POST', body: event });
+
+    const { source } = await api(app, '/api/traces/t1/mermaid', { method: 'POST', body: { labels: { 'order-api': 'Order API; #2' } } });
+    assert.equal(source.split('\n').slice(1).join('\n'), [
+      'sequenceDiagram',
+      '  title POST /api/orders',
+      '  participant browser',
+      '  participant order_api as Order API#59; #35;2',
+      '  participant payment',
+      '  browser->>+order_api: `POST` `/api/orders`',
+      '  order_api->>+payment: `POST` `/api/payments`',
+      '  rect rgba(255, 93, 115, 0.16)',
+      '    payment--x-order_api: 502 · 120ms',
+      '  end',
+      '  order_api-->>-browser: 201 · 180ms',
+      '',
+    ].join('\n'));
+
+    const { traces } = await api(app, '/api/traces');
+    assert.deepEqual(traces.map(({ method, path: pathname, status, hops, services }) => ({ method, pathname, status, hops, services })), [
+      { method: 'POST', pathname: '/api/orders', status: 201, hops: 2, services: ['browser', 'order-api', 'payment'] },
+    ]);
+
+    const saved = await api(app, '/api/traces/t1/mermaid', { method: 'POST', body: { save: true } });
+    assert.match(saved.name, /^post-api-orders-\d{6}$/);
+    assert.equal(fs.readFileSync(path.join(directory, `${saved.name}.mmd`), 'utf8'), saved.source);
+  } finally {
+    await app.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('an unanswered request has no activation to close', () => {
+  const { source } = traceToMermaid({ spans: [{ from: 'end', to: '9api', method: 'GET', path: '/x', startedAt: 5 }] });
+  assert.match(source, /participant end_ as end\n {2}participant s_9api as 9api\n {2}end_->>s_9api: `GET` `\/x`\n$/);
+});
+
+test('repeated calls collapse into a loop and bodies can become notes', () => {
+  const span = (id, method, pathname, startedAt, endedAt, status, extra = {}) => ({ id, from: 'order', to: 'auth', method, path: pathname, startedAt, endedAt, status, ...extra });
+  const trace = { spans: [
+    { id: 'root', from: 'browser', to: 'order', method: 'POST', path: '/orders', startedAt: 0, endedAt: 500, status: 201, requestBody: '{\n  "cart": "abc"\n}' },
+    span('a', 'GET', '/status', 10, 20, 202),
+    span('b', 'GET', '/status', 30, 60, 202),
+    span('c', 'GET', '/status', 70, 90, 200),
+    span('d', 'POST', '/token', 100, 110, 401),
+  ] };
+  const lines = traceToMermaid(trace, { notes: true }).source.split('\n').slice(6);
+  assert.deepEqual(lines, [
+    '  browser->>+order: `POST` `/orders`',
+    '  Note over browser,order: { "cart": "abc" }',
+    '  loop 3 times',
+    '    order->>+auth: `GET` `/status`',
+    '    auth-->>-order: 202, 200 · 10–30ms',
+    '  end',
+    '  order->>+auth: `POST` `/token`',
+    '  rect rgba(255, 93, 115, 0.16)',
+    '    auth--x-order: 401 · 10ms',
+    '  end',
+    '  order-->>-browser: 201 · 500ms',
+    '',
+  ]);
+  assert.equal(traceToMermaid(trace, { collapseRepeats: false }).source.match(/`GET` `\/status`/g).length, 3);
+});
+
+test('the diagram editor hears about files changed outside it', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'traceflow-diagram-watch-'));
+  const app = await startServer({ port: 0, config: { include: [], ignore, services: [], diagramsDir: directory } });
+  const controller = new AbortController();
+  try {
+    const response = await fetch(`${app.url}/api/diagrams/events`, { signal: controller.signal });
+    const reader = response.body.getReader();
+    fs.writeFileSync(path.join(directory, 'outside.mmd'), 'sequenceDiagram\n  a->>b: hi\n');
+    let received = '';
+    const deadline = Date.now() + 3000;
+    while (!received.includes('data: changed') && Date.now() < deadline) {
+      const { value, done } = await Promise.race([reader.read(), sleep(deadline - Date.now()).then(() => ({ done: true }))]);
+      if (done) break;
+      received += new TextDecoder().decode(value);
+    }
+    assert.match(received, /data: changed/);
+  } finally {
+    controller.abort();
+    await app.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('agents can write diagrams and draw traces through MCP', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'traceflow-mcp-diagrams-'));
+  const app = await startServer({ port: 0, config: { include: [], ignore, services: [], diagramsDir: directory } });
+  const mcp = spawn(process.execPath, [path.join(path.dirname(new URL(import.meta.url).pathname), 'mcp', 'server.mjs')], {
+    env: { ...process.env, TRACEFLOW_URL: app.url },
+    stdio: ['pipe', 'pipe', 'inherit'],
+  });
+  const replies = readline.createInterface({ input: mcp.stdout })[Symbol.asyncIterator]();
+  let id = 0;
+  const call = async (name, args) => {
+    mcp.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: ++id, method: 'tools/call', params: { name, arguments: args } })}\n`);
+    const reply = JSON.parse((await replies.next()).value);
+    assert.equal(reply.result.isError, undefined, reply.result.content?.[0]?.text);
+    return JSON.parse(reply.result.content[0].text);
+  };
+  try {
+    const written = await call('traceflow_diagram_write', { name: 'Checkout', source: 'sequenceDiagram\n  a->>b: hi\n' });
+    assert.equal(written.name, 'checkout');
+    assert.equal(written.url, `${app.url}/diagrams#checkout`);
+    assert.equal((await call('traceflow_diagram_write', { name: 'checkout', source: 'x', mode: 'create' })).name, 'checkout-2');
+    await call('traceflow_diagram_write', { name: 'checkout', source: 'sequenceDiagram\n  a->>b: bye\n', mode: 'replace' });
+    assert.equal((await call('traceflow_diagram_read', { name: 'checkout' })).source, 'sequenceDiagram\n  a->>b: bye\n');
+    assert.deepEqual((await call('traceflow_diagrams', {})).diagrams.map((item) => item.name).sort(), ['checkout', 'checkout-2']);
+
+    const at = Date.now() - 500;
+    for (const event of [
+      { type: 'span', traceId: 'mcp', spanId: 's', from: 'browser', to: 'api', method: 'GET', path: '/x', phase: 'start', at },
+      { type: 'span', traceId: 'mcp', spanId: 's', from: 'browser', to: 'api', method: 'GET', path: '/x', phase: 'end', at: at + 40, status: 200 },
+    ]) await api(app, '/ingest', { method: 'POST', body: event });
+    const drawn = await call('traceflow_trace_diagram', { traceId: 'mcp', save: true });
+    assert.match(drawn.source, /browser->>\+api: `GET` `\/x`/);
+    assert.equal(fs.readFileSync(path.join(directory, `${drawn.name}.mmd`), 'utf8'), drawn.source);
+  } finally {
+    mcp.kill();
+    await app.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });

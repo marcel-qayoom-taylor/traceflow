@@ -2,6 +2,7 @@
 
 import http from 'node:http';
 import { preflight, readiness, healthStatus } from './preflight.mjs';
+import { diagramStore, diagramsDirFor, traceToMermaid, watchDiagrams } from './diagrams.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -74,6 +75,9 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
     ignore: activeConfig.ignore || DEFAULT_IGNORE,
   };
   const traces = new Map();
+  const diagrams = diagramStore(diagramsDirFor(activeConfig));
+  const diagramClients = new Set();
+  let diagramWatch = null;
   const gates = [];
   const agents = new Map();
   const logEntries = [];
@@ -1327,6 +1331,91 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
           '__TRACEFLOW_TOKEN__': sessionToken,
         });
       }
+      if (req.method === 'GET' && (url.pathname === '/diagrams' || url.pathname === '/diagrams.html')) {
+        // Mermaid writes <style> into each SVG and sizes nodes with inline styles.
+        res.setHeader('content-security-policy', contentSecurityPolicy({ inlineStyles: true }));
+        return file(res, path.join(publicDir, 'diagrams.html'), 'text/html; charset=utf-8', {
+          '__TRACEFLOW_TOKEN__': sessionToken,
+        });
+      }
+      if (req.method === 'GET' && url.pathname === '/diagrams.js') {
+        return file(res, path.join(publicDir, 'diagrams.js'), 'text/javascript; charset=utf-8');
+      }
+      if (req.method === 'GET' && url.pathname === '/diagrams.css') {
+        return file(res, path.join(publicDir, 'diagrams.css'), 'text/css; charset=utf-8');
+      }
+      if (req.method === 'GET' && url.pathname === '/vendor/mermaid.min.js') {
+        // 5 MB and only changes with the vendored version, which the page puts in the query string.
+        mermaidBundle ||= fs.readFileSync(path.join(publicDir, 'vendor', 'mermaid.min.js'));
+        res.setHeader('cache-control', 'public, max-age=31536000, immutable');
+        res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'content-length': mermaidBundle.length });
+        return res.end(mermaidBundle);
+      }
+      if (req.method === 'GET' && url.pathname === '/api/diagrams/events') {
+        // The folder is only watched once the editor is open, so Traceflow never creates it otherwise.
+        diagramWatch ||= watchDiagrams(diagrams.dir, () => {
+          for (const client of [...diagramClients]) {
+            if (!writePacket(client, 'data: changed\n\n')) dropStream(diagramClients, client);
+          }
+        });
+        await diagramWatch;
+        res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+        // Sends the headers now, so clients know they are connected before anything changes.
+        if (!writePacket(res, ': connected\n\n')) return;
+        diagramClients.add(res);
+        req.on('close', () => diagramClients.delete(res));
+        return;
+      }
+      if (req.method === 'GET' && url.pathname === '/api/diagrams') {
+        return json(res, { dir: diagrams.dir, diagrams: await diagrams.list() });
+      }
+      if (req.method === 'POST' && url.pathname === '/api/diagrams') {
+        const body = await readJson(req);
+        const name = await diagrams.uniqueName(body.name || 'untitled');
+        return json(res, await diagrams.write(name, typeof body.source === 'string' ? body.source : ''), 201);
+      }
+      const renameMatch = url.pathname.match(/^\/api\/diagrams\/([^/]+)\/rename$/);
+      if (req.method === 'POST' && renameMatch) {
+        const body = await readJson(req);
+        return json(res, await diagrams.rename(decodeURIComponent(renameMatch[1]), String(body.to || '').trim()));
+      }
+      const diagramMatch = url.pathname.match(/^\/api\/diagrams\/([^/]+)$/);
+      if (diagramMatch) {
+        const name = decodeURIComponent(diagramMatch[1]);
+        if (req.method === 'GET') return json(res, await diagrams.read(name));
+        if (req.method === 'PUT') return json(res, await diagrams.write(name, (await readJson(req)).source));
+        if (req.method === 'DELETE') return json(res, await diagrams.remove(name));
+      }
+      if (req.method === 'GET' && url.pathname === '/api/traces') {
+        // A light listing for the diagrams page, which has no use for bodies and logs.
+        return json(res, {
+          traces: listedTraces().filter((trace) => trace.spans.length).slice(0, 25).map((trace) => {
+            const root = trace.spans.reduce((first, span) => (span.startedAt < first.startedAt ? span : first));
+            return {
+              id: trace.id,
+              startedAt: trace.startedAt,
+              method: root.method,
+              path: root.path.split('?')[0],
+              status: root.status,
+              hops: trace.spans.length,
+              services: [...new Set(trace.spans.flatMap((span) => [span.from, span.to]).filter(Boolean))],
+            };
+          }),
+        });
+      }
+      const mermaidMatch = url.pathname.match(/^\/api\/traces\/([^/]+)\/mermaid$/);
+      if (req.method === 'POST' && mermaidMatch) {
+        const trace = traces.get(decodeURIComponent(mermaidMatch[1]));
+        if (!trace) return json(res, { error: 'unknown trace' }, 404);
+        const body = await readJson(req);
+        const labels = Object.fromEntries(activeConfig.services.map(serviceView).filter((service) => service.repo).map((service) => [service.name, service.repo]));
+        if (body.labels && typeof body.labels === 'object') Object.assign(labels, body.labels);
+        const diagram = traceToMermaid(trace, { labels, collapseRepeats: body.collapseRepeats !== false, notes: Boolean(body.notes) });
+        if (!body.save) return json(res, diagram);
+        const name = await diagrams.uniqueName(`${diagram.title} ${new Date().toISOString().slice(11, 19).replace(/:/g, '')}`);
+        await diagrams.write(name, diagram.source);
+        return json(res, { ...diagram, name }, 201);
+      }
       if (req.method === 'GET' && url.pathname === '/app.js') {
         return file(res, path.join(publicDir, 'app.js'), 'text/javascript; charset=utf-8');
       }
@@ -1493,6 +1582,9 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
     for (const client of [...controlClients]) {
       if (!writePacket(client, ': ping\n\n')) dropStream(controlClients, client);
     }
+    for (const client of [...diagramClients]) {
+      if (!writePacket(client, ': ping\n\n')) dropStream(diagramClients, client);
+    }
   }, 15_000);
   controlPing.unref();
 
@@ -1501,6 +1593,10 @@ export async function startServer({ port = 9477, config, demo = false, limits } 
     clearTimeout(listenerTimer);
     clearInterval(expireTimer);
     clearInterval(controlPing);
+    (await diagramWatch?.catch(() => null))?.();
+    for (const client of diagramClients) {
+      try { client.end(); } catch { /* already gone */ }
+    }
     const ownedServices = activeConfig.services
       .filter((service) => runtimes.get(service.name)?.owner === 'traceflow');
     await Promise.all(ownedServices.map((service) => stopService(service.name)));
@@ -1896,6 +1992,8 @@ function stripAnsi(value) {
   return value.replace(/\u001b\[[0-9;]*m/g, '');
 }
 
+let mermaidBundle = null;
+
 function file(res, filePath, type, replacements = null) {
   let body = fs.readFileSync(filePath);
   if (replacements) {
@@ -1907,8 +2005,13 @@ function file(res, filePath, type, replacements = null) {
   res.end(body);
 }
 
+function contentSecurityPolicy({ inlineStyles = false } = {}) {
+  const styles = inlineStyles ? "'self' 'unsafe-inline'" : "'self'";
+  return `default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src ${styles}; script-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'`;
+}
+
 function applySecurityHeaders(res) {
-  res.setHeader('content-security-policy', "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'");
+  res.setHeader('content-security-policy', contentSecurityPolicy());
   res.setHeader('x-content-type-options', 'nosniff');
   res.setHeader('x-frame-options', 'DENY');
   res.setHeader('referrer-policy', 'no-referrer');
@@ -1928,7 +2031,7 @@ function requestOriginAllowed(req, port) {
 }
 
 function requiresSessionToken(req, url) {
-  return req.method === 'POST' || url.pathname === '/events' || url.pathname === '/api/control/stream';
+  return (req.method !== 'GET' && req.method !== 'HEAD') || url.pathname === '/events' || url.pathname === '/api/control/stream';
 }
 
 function requestToken(req, url) {

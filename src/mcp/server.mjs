@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import readline from 'node:readline';
+import { diagramStore, traceToMermaid } from '../diagrams.mjs';
 
 const traceflowUrl = process.env.TRACEFLOW_URL || 'http://127.0.0.1:9477';
 
@@ -75,6 +76,53 @@ const tools = [
     },
     annotations: { readOnlyHint: true },
   },
+  {
+    name: 'traceflow_diagrams',
+    description: 'List the Mermaid diagrams saved in the Traceflow diagram editor, newest first, with the folder that holds them.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: 'traceflow_diagram_read',
+    description: 'Read the Mermaid source of one saved Traceflow diagram.',
+    inputSchema: {
+      type: 'object',
+      properties: { name: { type: 'string', description: 'Diagram name from traceflow_diagrams, without .mmd.' } },
+      required: ['name'],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: 'traceflow_diagram_write',
+    description: 'Create or replace a Mermaid diagram in the Traceflow diagram editor. An open editor shows the change immediately. Wrap text in backticks to render it as inline code. Returns the diagram name and its editor URL.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Diagram name: letters, numbers, spaces, dots, dashes and underscores.' },
+        source: { type: 'string', description: 'Complete Mermaid source, for example starting with sequenceDiagram.' },
+        mode: { type: 'string', enum: ['create', 'replace'], description: 'create picks a free name if this one is taken; replace overwrites. Defaults to create.' },
+      },
+      required: ['name', 'source'],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true },
+  },
+  {
+    name: 'traceflow_trace_diagram',
+    description: 'Turn one captured trace into a Mermaid sequence diagram. Repeated calls collapse into loops and failed responses are highlighted. Optionally saves it to the diagram editor.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        traceId: { type: 'string', description: 'Trace ID returned by traceflow_overview.' },
+        save: { type: 'boolean', description: 'Save it as a new diagram in the editor. Defaults to false.' },
+        notes: { type: 'boolean', description: 'Add shortened request and response bodies as notes. Defaults to false.' },
+      },
+      required: ['traceId'],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false },
+  },
 ];
 
 const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
@@ -96,7 +144,7 @@ async function handle(message) {
       protocolVersion: message.params?.protocolVersion || '2025-03-26',
       capabilities: { tools: {} },
       serverInfo: { name: 'traceflow', version: '0.1.0' },
-      instructions: 'Use traceflow_overview first when debugging local running services. It only reads the local Traceflow instance; use traceflow_search_logs and traceflow_trace to drill down. traceflow_snapshot is the legacy verbose escape hatch.',
+      instructions: 'Use traceflow_overview first when debugging local running services. It only reads the local Traceflow instance; use traceflow_search_logs and traceflow_trace to drill down. traceflow_snapshot is the legacy verbose escape hatch. To draw or update Mermaid diagrams in the Traceflow editor, use traceflow_diagrams, traceflow_diagram_read and traceflow_diagram_write; traceflow_trace_diagram turns a captured trace into one.',
     });
   }
   if (message.method === 'tools/list') return result(message.id, { tools });
@@ -116,8 +164,11 @@ async function callTool(id, params) {
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       return result(id, { content: [{ type: 'text', text: JSON.stringify(await response.json()) }] });
     }
-    const state = await fetchState();
     const args = params.arguments || {};
+    if (params.name.startsWith('traceflow_diagram') || params.name === 'traceflow_trace_diagram') {
+      return result(id, { content: [{ type: 'text', text: JSON.stringify(await diagramTool(params.name, args), null, 2) }] });
+    }
+    const state = await fetchState();
     let content;
     switch (params.name) {
       case 'traceflow_overview':
@@ -261,6 +312,30 @@ function serviceSummary({ name, kind, status, agent, match, owner, pid }) {
 function clip(value, maxChars) {
   const text = String(value || '');
   return text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;
+}
+
+// Diagrams are files in the folder the running Traceflow reports, so the editor and agents always share one folder.
+async function diagramTool(name, args) {
+  const response = await fetch(`${traceflowUrl}/api/diagrams`, { signal: AbortSignal.timeout(2_000) });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const listing = await response.json();
+  const store = diagramStore(listing.dir);
+  const link = (diagram) => `${traceflowUrl}/diagrams#${encodeURIComponent(diagram)}`;
+  if (name === 'traceflow_diagrams') return listing;
+  if (name === 'traceflow_diagram_read') return store.read(args.name);
+  if (name === 'traceflow_diagram_write') {
+    const target = args.mode === 'replace' ? args.name : await store.uniqueName(args.name);
+    const saved = await store.write(target, args.source);
+    return { ...saved, url: link(saved.name) };
+  }
+  const state = await fetchState();
+  const trace = (state.traces || []).find((item) => item.id === args.traceId);
+  if (!trace) return { error: `Trace ${args.traceId} was not found. It may have expired from Traceflow's in-memory buffer.` };
+  const labels = Object.fromEntries((state.services || []).filter((service) => service.repo).map((service) => [service.name, service.repo]));
+  const diagram = traceToMermaid(trace, { labels, notes: Boolean(args.notes) });
+  if (!args.save) return diagram;
+  const saved = await store.write(await store.uniqueName(diagram.title), diagram.source);
+  return { ...diagram, name: saved.name, url: link(saved.name) };
 }
 
 async function fetchState() {

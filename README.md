@@ -84,7 +84,60 @@ Everything stays on your machine and captured data is held in memory only.
 - Status, slow-hop, and pin filters, with failing and slowest hops marked on the diagram
 - Pins that keep a trace when older ones expire
 - Service logs linked to the request that wrote them
-- Local service logs and a read-only MCP diagnostics server
+- Local service logs and an MCP server for diagnostics and diagrams
+- A local Mermaid editor with colour-coded participants, PNG/SVG copy and
+  download, and any captured trace turned into an editable sequence diagram
+
+## Diagrams
+
+Use the **Traces | Diagrams** switch in the header, or go to
+`http://127.0.0.1:9477/diagrams`, for a local Mermaid editor. It doesn't need any
+services. Type on the left and the preview updates as you go. Drag the divider
+to resize the editor, drag the preview to pan, scroll to zoom and double-click
+to fit.
+
+- **Export** holds every output: copy PNG (`⌘⇧C`), SVG or the Mermaid source,
+  or download PNG, SVG or `.mmd`.
+- The default **Colour** theme gives each participant its own colour. The
+  settings cog changes the theme and style, the PNG size and transparency, and
+  the editor's font size and line wrapping. It also shows where diagrams are
+  saved. A `%%{init}%%` theme in the source still takes precedence.
+- **From a trace** in the sidebar turns a recently captured trace into a
+  diagram, as does **Edit as diagram** on the traces view. **Copy Mermaid** copies
+  a trace without saving it. The diagram nests calls, shows the status and
+  duration of each response, and marks failures with `--x`. Participants use
+  your service names, or the repository name when you haven't set one. Query
+  strings are left out.
+- Wrap text in backticks for inline code: `` `POST` `/api/orders` including `recaptchaResponse` ``
+  draws each part in monospace on a soft background, in the preview and in exports.
+  Trace diagrams use this for each method and path. Other Mermaid renderers, such
+  as GitHub or mermaid.live, show the backticks as typed.
+- Click a message, note or participant in the preview to jump to its line. Put
+  the cursor on a line to highlight what it draws.
+- The editor colours Mermaid syntax and suggests keywords and participant names
+  as you type. Right after an arrow it suggests where the message can go. Use
+  `↑`/`↓` and `Enter` or `Tab`, or turn suggestions off in settings.
+- **Present** shows the diagram full screen. In a sequence diagram, `→` and
+  `←` (or a click) reveal one message at a time, and the view zooms to each new
+  message and the participants it involves. Participant names stay pinned to
+  the top once their boxes scroll away. Scroll or pinch to zoom, drag to pan,
+  press `+`, `-` or `0` (whole diagram), `F` to turn the follow zoom off, and
+  `Esc` to exit.
+- **Compare** in the sidebar puts two traces side by side. Messages only in A
+  are red, messages only in B are green, and responses that got noticeably
+  slower in B are amber. It starts with the latest trace and an earlier run of
+  the same request.
+- Trace diagrams group repeated calls, such as status polling, into one
+  `loop N times`, and draw each failed response on a red band. Settings can
+  turn grouping off or add shortened request and response bodies as notes.
+- Click a syntax error to jump to its line, which is also underlined.
+- Diagrams save as you type to `.mmd` files in `~/.traceflow/diagrams`. Set
+  `diagramsDir` in `traceflow.config.json` (relative to that file) or
+  `TRACEFLOW_DIAGRAMS_DIR` to keep them in a repository. Changes made to a file
+  in another editor or by an agent show up straight away.
+
+Mermaid 12.3.0 is bundled under `src/public/vendor` (MIT), so the editor works
+offline.
 
 ## Configuration
 
@@ -165,6 +218,13 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.
 summaries, and log search. It reads the local Traceflow instance at
 `http://127.0.0.1:9477`; set `TRACEFLOW_URL` to use another loopback port.
 
+Its diagram tools let an agent draw for you: `traceflow_diagrams` and
+`traceflow_diagram_read` read the editor's diagrams, `traceflow_diagram_write`
+creates or replaces one, and `traceflow_trace_diagram` turns a captured trace
+into a sequence diagram and can save it. These are the only MCP tools that
+write, and they only write `.mmd` files in the diagrams folder. An open editor
+shows each change immediately.
+
 ## License
 
 [MIT](LICENSE)
@@ -203,7 +263,7 @@ available. This confirms agent activity, not queue connectivity or job progress.
 
 Local API: `GET /api/preflight?service=name`, `GET /api/stacks`, and session-token
 protected `POST /api/stacks/:name/start` or `/stop`. Lifecycle controls retain the
-existing loopback, origin and session-token checks. MCP remains read-only.
+existing loopback, origin and session-token checks. MCP cannot start or stop stacks.
 
 Stacks wait up to ten seconds for each newly started service with a configured
 `healthPath` before starting the next member. Without one, startup confirms only

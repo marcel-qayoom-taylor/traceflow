@@ -14,6 +14,10 @@
       <strong>Traceflow</strong>
       <span>sequence debugger</span>
     </div>
+    <nav class="view-tabs" aria-label="Views">
+      <a href="/" aria-current="page">Traces</a>
+      <a href="/diagrams">Diagrams</a>
+    </nav>
     <div class="transport" id="transport"></div>
     <div class="settings">
       <button type="button" id="settings-toggle" class="settings-toggle" aria-label="Settings" title="Settings" aria-expanded="false" aria-controls="settings-panel">⚙️</button>
@@ -63,6 +67,7 @@
     <section class="stage">
       <div id="held" class="held"></div>
       <div id="diagram" class="diagram"></div>
+      <div id="diagram-actions" class="diagram-actions" hidden></div>
     </section>
     <div
       id="inspector-resizer"
