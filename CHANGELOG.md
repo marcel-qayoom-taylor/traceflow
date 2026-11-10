@@ -16,6 +16,7 @@ This project follows Semantic Versioning.
 - Show diagram changes made outside the editor, by another editor or an agent, straight away.
 - Add MCP tools to list, read and write diagrams and to turn a trace into a diagram.
 - Scope the trace diagram's SVG styles to the diagram so they no longer affect other SVGs.
+- Give the Traces and Diagrams sidebars the same width, line the Scan button up with the service cards, and stop the "Start here" hint flashing while the page loads.
 - Add process services for Node programs without a port, such as queue workers. Configure one without a `port`, or attach one from **Scan**. Traceflow can start and stop it, show its logs, and trace its outbound calls. It reattaches after a restart, including when a watcher such as `nodemon` or `tsx` restarts the worker.
 - Report each service's kind in MCP diagnostics.
 - Show each log line from a service Traceflow started once instead of twice, and redact secrets in its piped output too.

@@ -13,6 +13,7 @@
   --shadow: 0 16px 40px rgba(0, 0, 0, 0.28);
   --logs-height: 168px;
   --inspector-width: 340px;
+  --rail-width: 280px;
   font-family: "IBM Plex Sans", "Avenir Next", "Segoe UI", sans-serif;
 }
 
@@ -121,7 +122,7 @@ button:focus-visible, select:focus-visible, input:focus-visible {
 }
 .settings-action:hover { background: var(--panel-2); }
 
-main { display: grid; grid-template-columns: 280px minmax(360px, 1fr) 10px minmax(240px, var(--inspector-width)); min-height: 0; }
+main { display: grid; grid-template-columns: var(--rail-width) minmax(360px, 1fr) 10px minmax(240px, var(--inspector-width)); min-height: 0; }
 .rail, .inspector, .stage { min-height: 0; }
 .rail, .inspector { background: var(--panel); }
 .rail { border-right: 1px solid var(--line); display: flex; flex-direction: column; }
@@ -177,7 +178,9 @@ main { display: grid; grid-template-columns: 280px minmax(360px, 1fr) 10px minma
 .grow { display: flex; flex-direction: column; min-height: 0; flex: 1; }
 #services, #traces { overflow: auto; padding: 0 12px 16px; }
 #traces > .meta { margin-top: 4px; padding-left: 9px; }
-#services { flex: 1 1 auto; min-height: 0; }
+#services { flex: 1 1 auto; min-height: 0; scrollbar-gutter: stable; }
+/* Line Scan up with the service cards, which sit left of the list's scrollbar. */
+.rail > section:first-child > .section-title { padding-right: calc(12px + var(--services-gutter, 0px)); }
 .trace-search { display: flex; flex-direction: column; gap: 6px; padding: 0 12px 10px; }
 .trace-search-bar {
   display: flex;

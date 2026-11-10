@@ -820,6 +820,11 @@ function serviceIndicator(service, pendingAction) {
   return { tone: 'grey', label: 'Stopped, not attached' };
 }
 
+function measureServicesGutter() {
+  const list = $('services');
+  document.documentElement.style.setProperty('--services-gutter', `${list.offsetWidth - list.clientWidth}px`);
+}
+
 function renderServices() {
   const root = $('services');
   const hasAttachedService = state.services.some((service) => service.attached || service.agent);
@@ -2139,4 +2144,7 @@ window.addEventListener('keydown', (event) => {
 
 initializeLogResizer();
 initializeInspectorResizer();
+// The gutter is reserved even when the list doesn't scroll, so it only changes with page zoom.
+measureServicesGutter();
+window.addEventListener('resize', measureServicesGutter);
 connect();

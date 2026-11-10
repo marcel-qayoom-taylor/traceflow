@@ -31,7 +31,7 @@ body.editor-resizing { cursor: ew-resize; user-select: none; }
 .menu kbd { color: var(--muted); font: 11px ui-monospace, "SF Mono", Menlo, monospace; }
 
 .diagrams-main {
-  grid-template-columns: var(--rail-column, 240px) var(--editor-column, minmax(240px, var(--editor-width, 420px))) var(--resizer-column, 10px) minmax(0, 1fr);
+  grid-template-columns: var(--rail-column, var(--rail-width)) var(--editor-column, minmax(240px, var(--editor-width, 420px))) var(--resizer-column, 10px) minmax(0, 1fr);
   min-height: 0;
 }
 .diagrams-main.sidebar-hidden { --rail-column: 52px; }
