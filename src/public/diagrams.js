@@ -3,6 +3,8 @@ const SESSION_TOKEN = document.querySelector('meta[name="traceflow-token"]')?.co
 // v2 resets everyone to the Colour theme and drops the old hand-drawn look.
 const SETTINGS_PREFIX = 'traceflow.diagrams.v2.';
 const EDITOR_WIDTH_KEY = 'traceflow.diagrams.editor-width';
+const TRACES_OPEN_KEY = 'traceflow.diagrams.traces-open';
+const DIAGRAM_TRACES_KEY = 'traceflow.diagrams.trace-links';
 const SERVICE_ALIASES_KEY = 'traceflow.service-aliases';
 const EDITOR_MIN_WIDTH = 240;
 const PREVIEW_MIN_WIDTH = 320;
@@ -48,6 +50,11 @@ const els = {
   settingsPanel: $('settings-panel'),
   filter: $('diagram-filter'),
   traces: $('trace-list'),
+  traceFilter: $('trace-filter'),
+  traceToggle: $('toggle-traces'),
+  traceBody: $('trace-body'),
+  traceCount: $('trace-count'),
+  compareTrace: $('compare-trace'),
   resizer: $('editor-resizer'),
   highlight: $('source-highlight'),
   completions: $('completions'),
@@ -57,6 +64,7 @@ const els = {
 };
 
 let diagrams = [];
+let capturedTraces = [];
 let current = null; // { name, savedSource, updatedAt }
 let saveTimer = null;
 let renderTimer = null;
@@ -142,8 +150,17 @@ function emptyNote(text) {
 function renderList() {
   const query = els.filter.value.trim().toLowerCase();
   const shown = diagrams.filter((diagram) => diagram.name.toLowerCase().includes(query));
-  els.list.replaceChildren(...shown.map((diagram) => {
-    const item = listItem(diagram.name, relativeTime(diagram.updatedAt), () => { void openDiagram(diagram.name); });
+  els.list.replaceChildren(...shown.map((diagram, index) => {
+    const item = listItem(diagram.name, relativeTime(diagram.updatedAt), () => {
+      setEditorHidden(false);
+      void openDiagram(diagram.name);
+    });
+    const number = document.createElement('span');
+    number.className = 'diagram-number';
+    number.textContent = String(index + 1);
+    item.prepend(number);
+    item.title = diagram.name;
+    item.setAttribute('aria-label', diagram.name);
     item.setAttribute('aria-current', String(diagram.name === current?.name));
     return item;
   }));
@@ -152,21 +169,56 @@ function renderList() {
 
 async function loadTraces() {
   try {
-    const { traces } = await request('/api/traces');
-    els.traces.replaceChildren(...traces.slice(0, 12).map((trace) => {
-      const status = trace.status ?? '…';
-      const item = listItem(
-        `${trace.method} ${trace.path}`,
-        `${status} · ${trace.hops} hop${trace.hops === 1 ? '' : 's'} · ${new Date(trace.startedAt).toLocaleTimeString()}`,
-        () => { void createFromTrace(trace.id); },
-        'diagram-item trace',
-      );
-      item.title = trace.services.join(' → ');
-      if (Number(trace.status) >= 400) item.querySelector('span').classList.add('bad');
-      return item;
-    }));
-    if (!traces.length) els.traces.append(emptyNote('Captured traces show up here. Click one to turn it into a diagram.'));
-  } catch { /* the list is optional */ }
+    ({ traces: capturedTraces } = await request('/api/traces'));
+  } catch {
+    return; // the list is optional
+  }
+  renderTraces();
+}
+
+function renderTraces() {
+  const traces = capturedTraces;
+  els.traceCount.textContent = traces.length ? `(${traces.length})` : '';
+  const query = els.traceFilter.value.trim().toLowerCase();
+  const shown = traces.filter((trace) => `${trace.method} ${trace.path} ${trace.status ?? ''} ${trace.services.join(' ')}`.toLowerCase().includes(query));
+  els.traces.replaceChildren(...shown.map((trace) => {
+    const status = trace.status ?? '…';
+    const item = listItem(
+      `${trace.method} ${trace.path}`,
+      `${status} · ${trace.hops} hop${trace.hops === 1 ? '' : 's'} · ${new Date(trace.startedAt).toLocaleTimeString()}`,
+      () => { void createFromTrace(trace.id); },
+      'diagram-item trace',
+    );
+    item.title = trace.services.join(' → ');
+    if (Number(trace.status) >= 400) item.querySelector('span').classList.add('bad');
+    return item;
+  }));
+  if (!traces.length) els.traces.append(emptyNote('Captured traces show up here. Click one to turn it into a diagram.'));
+  else if (!shown.length) els.traces.append(emptyNote('No traces match.'));
+}
+
+function setTracesOpen(open) {
+  els.traceBody.hidden = !open;
+  els.traceToggle.setAttribute('aria-expanded', String(open));
+  writeSetting(TRACES_OPEN_KEY, open ? '1' : '0');
+}
+
+// Saved diagrams do not record their trace, so this browser remembers which trace each one was drawn from.
+function diagramTraces() {
+  try { return JSON.parse(localStorage.getItem(DIAGRAM_TRACES_KEY)) || {}; } catch { return {}; }
+}
+function linkTrace(name, traceId) {
+  const links = diagramTraces();
+  if (traceId) links[name] = traceId;
+  else delete links[name];
+  writeSetting(DIAGRAM_TRACES_KEY, JSON.stringify(links));
+  updateCompareButton();
+}
+function currentTraceId() {
+  return current && diagramTraces()[current.name];
+}
+function updateCompareButton() {
+  els.compareTrace.hidden = !currentTraceId();
 }
 
 // ---------- open / save ----------
@@ -188,6 +240,7 @@ async function openDiagram(name, { replaceHash = false } = {}) {
   if (location.hash !== hash) history[replaceHash ? 'replaceState' : 'pushState'](null, '', hash);
   document.title = `${name} · Traceflow Diagrams`;
   view.userMoved = false;
+  updateCompareButton();
   renderList();
   void renderPreview();
 }
@@ -243,6 +296,7 @@ async function createFromTrace(id) {
   await flushSave();
   try {
     const created = await traceMermaid(id, { save: true });
+    linkTrace(created.name, id);
     await loadList();
     await openDiagram(created.name);
   } catch (err) {
@@ -260,7 +314,10 @@ async function renameCurrent() {
   await flushSave();
   try {
     await request(`${diagramUrl(current.name)}/rename`, { method: 'POST', body: { to } });
+    const traceId = currentTraceId();
+    linkTrace(current.name, null);
     current.name = to;
+    linkTrace(to, traceId);
     history.replaceState(null, '', `#${encodeURIComponent(to)}`);
     document.title = `${to} · Traceflow Diagrams`;
     await loadList();
@@ -281,6 +338,7 @@ async function deleteCurrent() {
     return;
   }
   current = null;
+  linkTrace(name, null);
   const remaining = await loadList();
   if (remaining.length) await openDiagram(remaining[0].name, { replaceHash: true });
   else showEmptyEditor();
@@ -299,6 +357,7 @@ function showEmptyEditor() {
   history.replaceState(null, '', location.pathname);
   els.preview.replaceChildren();
   els.error.hidden = true;
+  updateCompareButton();
   renderList();
 }
 
@@ -340,6 +399,13 @@ function initMermaid() {
     // Plain SVG text keeps the canvas untainted so the PNG export works.
     htmlLabels: false,
     flowchart: { htmlLabels: false },
+    sequence: {
+      // Notes and branch labels need clearance from the numbered message circles.
+      boxMargin: 24,
+      boxTextMargin: 10,
+      noteMargin: 16,
+      messageMargin: 50,
+    },
     suppressErrorRendering: true,
   });
 }
@@ -373,6 +439,7 @@ async function renderPreview() {
     els.preview.classList.remove('stale');
     // The config now reflects the theme this render used, including one set by a %%{init}%% directive.
     paper = mermaid.mermaidAPI.getConfig().themeVariables?.background || '#ffffff';
+    protectSequenceLabels(node, paper);
     els.preview.style.setProperty('--paper', paper);
     els.error.hidden = true;
     setErrorLine(0);
@@ -391,6 +458,37 @@ async function renderPreview() {
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const CODE_FONT = 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+
+// Sequence labels can cross participant lifelines. Give each label a paper-coloured
+// backing inside its own SVG filter so it travels with the text in presentations
+// and exports, without adding shapes that source linking could mistake for notes.
+function protectSequenceLabels(svg, background) {
+  const labels = svg.querySelectorAll('text.loopText, text.messageText');
+  if (!labels.length) return;
+  const defs = document.createElementNS(SVG_NS, 'defs');
+  svg.prepend(defs);
+  for (const [index, label] of [...labels].entries()) {
+    const box = label.getBBox();
+    if (!box.width || !box.height) continue;
+    const filter = document.createElementNS(SVG_NS, 'filter');
+    const id = `${svg.id}-label-backing-${index}`;
+    filter.id = id;
+    filter.setAttribute('filterUnits', 'userSpaceOnUse');
+    for (const [key, value] of Object.entries({ x: box.x - 3, y: box.y - 1, width: box.width + 6, height: box.height + 2 })) {
+      filter.setAttribute(key, String(value));
+    }
+    const flood = document.createElementNS(SVG_NS, 'feFlood');
+    flood.setAttribute('flood-color', background);
+    const merge = document.createElementNS(SVG_NS, 'feMerge');
+    const backing = document.createElementNS(SVG_NS, 'feMergeNode');
+    const text = document.createElementNS(SVG_NS, 'feMergeNode');
+    text.setAttribute('in', 'SourceGraphic');
+    merge.append(backing, text);
+    filter.append(flood, merge);
+    defs.append(filter);
+    label.setAttribute('filter', `url(#${id})`);
+  }
+}
 
 // Mermaid labels have no inline code, so draw `backticked` text in a monospace pill ourselves.
 // It edits the rendered SVG, which the PNG and SVG exports copy.
@@ -1302,17 +1400,20 @@ function traceLabel(trace) {
   return `${trace.method} ${trace.path} · ${trace.status ?? '…'} · ${new Date(trace.startedAt).toLocaleTimeString()}`;
 }
 
-async function openCompare() {
+async function openCompare(baselineId) {
   let traces;
   try {
     ({ traces } = await request('/api/traces'));
   } catch (err) {
     return showToast(err.message, { error: true });
   }
-  if (traces.length < 2) return showToast('Capture at least two traces to compare them.', { error: true });
-  // Default to the latest trace and an earlier run of the same request.
-  const latest = traces[0];
-  const earlier = traces.slice(1).find((trace) => trace.method === latest.method && trace.path === latest.path) || traces[1];
+  const baseline = traces.find((trace) => trace.id === baselineId);
+  // Traces live in the server's memory, so a restart or newer traffic can push this one out.
+  if (!baseline) return showToast('The trace behind this diagram is no longer captured. Draw it again from a fresh trace.', { error: true });
+  const others = traces.filter((trace) => trace.id !== baseline.id);
+  if (!others.length) return showToast('Capture another trace to compare this one with.', { error: true });
+  // Compare with the latest other run of the same request, if there is one.
+  const comparison = others.find((trace) => trace.method === baseline.method && trace.path === baseline.path) || others[0];
 
   const overlay = document.createElement('div');
   overlay.className = 'compare';
@@ -1321,7 +1422,7 @@ async function openCompare() {
   const head = document.createElement('div');
   head.className = 'compare-head';
   const title = document.createElement('strong');
-  title.textContent = 'Compare traces';
+  title.textContent = 'Compare captured traces';
   const picker = (label, selected) => {
     const wrap = document.createElement('label');
     const select = document.createElement('select');
@@ -1329,8 +1430,8 @@ async function openCompare() {
     wrap.append(label, select);
     return { wrap, select };
   };
-  const before = picker('A', earlier);
-  const after = picker('B', latest);
+  const before = picker('A · this diagram', baseline);
+  const after = picker('B · compare with', comparison);
   const summary = document.createElement('span');
   summary.className = 'compare-summary';
   const legend = document.createElement('span');
@@ -1371,6 +1472,7 @@ async function openCompare() {
         panes[index].diagram.innerHTML = svg;
         const node = panes[index].diagram.querySelector('svg');
         styleInlineCode(node);
+        protectSequenceLabels(node, mermaid.mermaidAPI.getConfig().themeVariables?.background || '#ffffff');
         svgs.push(node);
         panes[index].heading.textContent = `${index ? 'B' : 'A'} · ${traceLabel(traces.find((trace) => trace.id === ids[index]))}`;
       }
@@ -1458,7 +1560,30 @@ els.name.addEventListener('keydown', (event) => {
 els.name.addEventListener('blur', () => { void renameCurrent(); });
 els.remove.addEventListener('click', () => { void deleteCurrent(); });
 $('present').addEventListener('click', startPresentation);
-$('compare-traces').addEventListener('click', () => { void openCompare(); });
+els.compareTrace.addEventListener('click', () => {
+  const traceId = currentTraceId();
+  if (traceId) void openCompare(traceId);
+});
+els.traceToggle.addEventListener('click', () => setTracesOpen(els.traceBody.hidden));
+els.traceFilter.addEventListener('input', renderTraces);
+setTracesOpen(readSetting(TRACES_OPEN_KEY, '0') === '1');
+$('toggle-sidebar').addEventListener('click', () => {
+  const collapsed = document.querySelector('.diagrams-main').classList.toggle('sidebar-hidden');
+  const button = $('toggle-sidebar');
+  button.setAttribute('aria-expanded', String(!collapsed));
+  button.setAttribute('aria-label', collapsed ? 'Expand diagram sidebar' : 'Collapse diagram sidebar');
+  button.title = collapsed ? 'Expand sidebar' : 'Collapse sidebar';
+  button.textContent = collapsed ? '›' : '‹';
+  requestAnimationFrame(fit);
+});
+function setEditorHidden(hidden) {
+  document.querySelector('.diagrams-main').classList.toggle('editor-hidden', hidden);
+  $('toggle-editor').setAttribute('aria-expanded', String(!hidden));
+  $('show-editor').hidden = !hidden;
+  requestAnimationFrame(fit);
+}
+$('toggle-editor').addEventListener('click', () => setEditorHidden(true));
+$('show-editor').addEventListener('click', () => setEditorHidden(false));
 els.filter.addEventListener('input', renderList);
 els.error.addEventListener('click', () => {
   if (errorLine) selectLine(errorLine);

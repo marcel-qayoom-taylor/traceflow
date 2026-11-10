@@ -20,7 +20,8 @@
       <a href="/diagrams" aria-current="page">Diagrams</a>
     </nav>
     <div class="transport">
-      <button type="button" id="present" title="Present full screen, revealing a sequence diagram one message at a time">▶ Present</button>
+      <button type="button" id="compare-trace" title="Compare the trace this diagram was drawn from with another captured trace" hidden>Compare to another trace</button>
+      <button type="button" id="present" title="Present full screen, revealing a sequence diagram one message at a time"><span class="present-icon" aria-hidden="true">▶</span> Present</button>
       <button type="button" id="export-toggle" class="primary" popovertarget="export-menu" aria-haspopup="menu">Export ▾</button>
     </div>
     <div class="settings">
@@ -90,11 +91,12 @@
     <button type="button" role="menuitem" data-template="blank">Blank</button>
   </div>
   <main class="diagrams-main">
-    <aside class="rail diagram-rail">
+    <aside id="diagram-sidebar" class="rail diagram-rail">
       <section class="grow">
         <div class="section-title">
-          <span>Diagrams</span>
+          <span class="rail-label">Diagrams</span>
           <button type="button" id="new-diagram" class="text" popovertarget="new-menu" aria-haspopup="menu">New ▾</button>
+          <button type="button" id="toggle-sidebar" class="pane-toggle" aria-label="Collapse diagram sidebar" aria-expanded="true" aria-controls="diagram-sidebar" title="Collapse sidebar">‹</button>
         </div>
         <div class="trace-search">
           <div class="trace-search-bar">
@@ -105,17 +107,26 @@
       </section>
       <section class="trace-picker">
         <div class="section-title">
-          <span>From a trace</span>
-          <button type="button" id="compare-traces" class="text" title="Compare two traces side by side">Compare</button>
+          <button type="button" id="toggle-traces" class="trace-toggle" aria-expanded="false" aria-controls="trace-body">
+            <span class="trace-toggle-caret" aria-hidden="true">▸</span> From a trace <span id="trace-count" class="trace-count"></span>
+          </button>
         </div>
-        <div id="trace-list" class="diagram-list"></div>
+        <div id="trace-body" class="trace-body" hidden>
+          <div class="trace-search">
+            <div class="trace-search-bar">
+              <input id="trace-filter" type="search" placeholder="Filter traces" aria-label="Filter traces">
+            </div>
+          </div>
+          <div id="trace-list" class="diagram-list"></div>
+        </div>
       </section>
     </aside>
-    <section class="editor-pane">
+    <section id="diagram-editor" class="editor-pane">
       <div class="editor-head">
         <input id="diagram-name" class="diagram-name" type="text" spellcheck="false" aria-label="Diagram name" disabled>
         <span id="save-state" class="save-state"></span>
         <button type="button" id="delete-diagram" class="delete-button" title="Delete diagram" disabled>Delete</button>
+        <button type="button" id="toggle-editor" class="pane-toggle" aria-label="Close editor" aria-controls="diagram-editor" aria-expanded="true" title="Close editor">×</button>
       </div>
       <div class="source-wrap">
         <pre id="source-highlight" class="source source-highlight" aria-hidden="true"></pre>
@@ -134,6 +145,7 @@
     ></div>
     <section class="preview-pane">
       <div id="preview" class="preview" aria-label="Diagram preview"></div>
+      <button type="button" id="show-editor" class="show-editor" aria-controls="diagram-editor" title="Open editor" hidden>Open editor</button>
       <div class="preview-controls">
         <button type="button" id="zoom-out" title="Zoom out">−</button>
         <button type="button" id="zoom-fit" title="Fit to view (double-click)">Fit</button>

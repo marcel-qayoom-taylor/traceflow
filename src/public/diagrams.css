@@ -31,11 +31,42 @@ body.editor-resizing { cursor: ew-resize; user-select: none; }
 .menu kbd { color: var(--muted); font: 11px ui-monospace, "SF Mono", Menlo, monospace; }
 
 .diagrams-main {
-  grid-template-columns: 240px minmax(240px, var(--editor-width, 420px)) 10px minmax(320px, 1fr);
+  grid-template-columns: var(--rail-column, 240px) var(--editor-column, minmax(240px, var(--editor-width, 420px))) var(--resizer-column, 10px) minmax(0, 1fr);
   min-height: 0;
 }
+.diagrams-main.sidebar-hidden { --rail-column: 52px; }
+.diagrams-main.editor-hidden { --editor-column: 0px; --resizer-column: 0px; }
+.diagrams-main.editor-hidden .editor-pane,
+.diagrams-main.editor-hidden .editor-resizer { display: none; }
+.diagram-rail { grid-column: 1; min-width: 0; }
+.editor-pane { grid-column: 2; }
+.editor-resizer { grid-column: 3; }
+.preview-pane { grid-column: 4; }
+.sidebar-hidden .rail-label, .sidebar-hidden #new-diagram, .sidebar-hidden .trace-search,
+.sidebar-hidden .trace-picker, .sidebar-hidden .diagram-item strong, .sidebar-hidden .diagram-item span,
+.sidebar-hidden .diagram-empty { display: none; }
+.sidebar-hidden .section-title { justify-content: center; padding-inline: 0; }
+.diagram-rail .section-title { gap: 6px; }
+.diagram-rail .rail-label { margin-right: auto; }
+.present-icon { font-size: 10px; margin-right: 3px; }
+.sidebar-hidden .diagram-list { padding: 0 4px; }
+.sidebar-hidden .diagram-item { align-items: center; padding: 8px 0; }
+.diagram-number { display: none; }
+.sidebar-hidden .diagram-item .diagram-number { display: inline; color: var(--ink); font-size: 13px; }
+.pane-toggle { border: 0; background: transparent; color: var(--muted); font-size: 18px; cursor: pointer; }
+.pane-toggle:hover { color: var(--ink); }
+.show-editor { position: absolute; top: 10px; left: 10px; z-index: 2; padding: 5px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--ink); cursor: pointer; }
+.show-editor[hidden] { display: none; }
 .diagram-rail > section:first-child { max-height: none; }
 .trace-picker { display: flex; max-height: 40%; min-height: 0; flex-direction: column; border-top: 1px solid var(--line); }
+.trace-body { display: flex; min-height: 0; flex-direction: column; }
+.trace-body[hidden] { display: none; }
+.trace-toggle { display: inline-flex; align-items: center; gap: 6px; padding: 0; border: 0; background: transparent; color: inherit; font: inherit; letter-spacing: inherit; text-transform: inherit; cursor: pointer; }
+.trace-toggle:hover { color: var(--ink); }
+.trace-toggle-caret { display: inline-block; transition: transform 120ms ease; }
+.trace-toggle[aria-expanded="true"] .trace-toggle-caret { transform: rotate(90deg); }
+.trace-count { color: var(--muted); letter-spacing: 0; text-transform: none; }
+#compare-trace[hidden] { display: none; }
 .diagram-list { overflow: auto; padding: 0 8px 12px; }
 .diagram-item {
   display: flex;
@@ -296,7 +327,7 @@ body.editor-resizing { cursor: ew-resize; user-select: none; }
 .compare-pane { display: flex; min-width: 0; min-height: 0; flex-direction: column; background: var(--bg); }
 .compare-pane h3 { margin: 0; padding: 10px 14px; color: var(--muted); font: 12px ui-monospace, "SF Mono", Menlo, monospace; }
 .compare-diagram { flex: 1; min-height: 0; overflow: auto; padding: 16px; }
-.compare-diagram svg { display: block; width: 100%; height: auto; max-width: none !important; }
+.compare-diagram svg { display: block; height: auto; margin: 0 auto; }
 .compare .tf-diff-removed { filter: drop-shadow(0 0 3px rgba(255, 93, 115, 0.9)); }
 .compare .tf-diff-added { filter: drop-shadow(0 0 3px rgba(79, 209, 165, 0.95)); }
 .compare .tf-diff-slower { filter: drop-shadow(0 0 3px rgba(245, 181, 68, 0.95)); }
@@ -338,6 +369,10 @@ body.editor-resizing { cursor: ew-resize; user-select: none; }
 @media (max-width: 980px) {
   body.diagrams-page { height: auto; overflow: auto; }
   .diagrams-main { grid-template-columns: 1fr; grid-template-rows: auto 50vh 60vh; }
+  .diagram-rail, .editor-pane, .editor-resizer, .preview-pane { grid-column: 1; }
+  .diagrams-main.sidebar-hidden { grid-template-rows: auto 50vh 60vh; }
+  .diagrams-main.editor-hidden { grid-template-rows: auto 60vh; }
+  .diagrams-main.sidebar-hidden.editor-hidden { grid-template-rows: auto 80vh; }
   .editor-resizer { display: none; }
   .compare-body { grid-template-columns: 1fr; }
   .editor-pane { border-bottom: 1px solid var(--line); }
