@@ -6,10 +6,12 @@ This project follows Semantic Versioning.
 
 ## Unreleased
 
+## 0.2.0 - 2026-11-10
+
 - Add a local Mermaid editor at `/diagrams`, reached from a Traces | Diagrams switch in the header. It saves `.mmd` files, colours each participant, and exports PNG, SVG or source to the clipboard or a file from one Export menu. Any trace can be copied as a Mermaid sequence diagram or turned into an editable one.
 - In the diagram editor, click part of the preview to jump to its source line, and see the current line highlighted in the preview. The editor colours syntax and suggests keywords and participants.
 - Present a diagram full screen, revealing a sequence diagram one message at a time while the view zooms to each new message. Zoom and pan by hand at any time.
-- Compare two traces side by side, with added, missing and slower calls marked.
+- Compare a diagram drawn from a trace with another captured trace side by side, with added, missing and slower calls marked. The trace list folds away behind a toggle and can be filtered.
 - Group repeated calls in trace diagrams into loops, put failed responses on a red band, and optionally add bodies as notes.
 - Show diagram changes made outside the editor, by another editor or an agent, straight away.
 - Add MCP tools to list, read and write diagrams and to turn a trace into a diagram.
